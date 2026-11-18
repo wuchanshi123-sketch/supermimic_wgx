@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import json
 import time
-from concurrent.futures import Future, ThreadPoolExecutor
+from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Annotated, Literal
 
 import torch
@@ -38,6 +42,7 @@ from supermimic.utils.helpers import (
   extract_action_scale_offset,
   unpack_obs_dims,
 )
+from supermimic.utils.local_checkpoints import update_latest_checkpoint
 from supermimic.utils.logger import Logger
 from supermimic.utils.wandb_artifacts import download_model_dir, log_model_artifact
 
@@ -54,7 +59,7 @@ class BaseRunnerCfg:
   representation: str = "gencoord"  # "gencoord" or "maxcoord"
   actor_obs: str = "rep_state"  # "rep_state" or "proprio"
   log_interval: int = 10
-  save_interval: int = 1000
+  save_interval: int = 2000
   history_length: int = 1
   termination_softness: float = 0.05
   dynamics_hidden_dims: tuple[int, ...] = (2048, 2048, 2048)
@@ -455,13 +460,29 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
     """Subclasses override to update the actor obs normalizer."""
     raise NotImplementedError
 
-  def _create_log_dir(self, *extra_parts: str) -> Path:
+  def _create_log_dir(self) -> Path:
     """Create and return a timestamped log directory."""
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    log_dir = Path("logs", self.task_id, *extra_parts, timestamp)
-    log_dir.mkdir(parents=True, exist_ok=True)
+    log_dir = Path("logs", self.task_id, timestamp)
+    log_dir.mkdir(parents=True)
     print(f"[INFO] Logging to {log_dir}")
     return log_dir
+
+  @contextmanager
+  def _stage_checkpoint(self, checkpoint_dir: Path) -> Iterator[Path]:
+    """Make the checkpoint directory visible after all files are saved."""
+    with TemporaryDirectory(
+      dir=checkpoint_dir.parent, prefix=f".{checkpoint_dir.name}-"
+    ) as temp_dir:
+      staging_dir = Path(temp_dir)
+      (staging_dir / "runner_config.json").write_text(
+        json.dumps({"runner_cfg": asdict(self.cfg)}, indent=2) + "\n",
+        encoding="utf-8",
+      )
+      yield staging_dir
+      staging_dir.rename(checkpoint_dir)
+    update_latest_checkpoint(checkpoint_dir)
+    print(f"[INFO] Saved checkpoint: {checkpoint_dir}")
 
   def _init_wandb(self, log_dir: Path, name_suffix: str = "") -> None:
     """Initialize the W&B run and link the registry artifacts."""
@@ -650,12 +671,45 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
     for actor_td in actor_inputs:
       self.policy_learner.actor.update_normalization(actor_td)
 
+  def _save_checkpoint(self, checkpoint_dir: Path) -> list[str]:
+    assert wandb.run is not None  # _init_wandb ran before saving.
+    with self._stage_checkpoint(checkpoint_dir) as staging_dir:
+      world_model_path = str(staging_dir / "world_model.pt")
+      actor_path = str(staging_dir / "actor.pt")
+      torch.save(self._wm.bundle(), world_model_path)
+      torch.save(self.policy_learner.actor.state_dict(), actor_path)
+      checkpoint_files = [world_model_path, actor_path]
+      critic = getattr(self.policy_learner, "critic", None)
+      if critic is not None:
+        critic_path = str(staging_dir / "critic.pt")
+        torch.save(critic.state_dict(), critic_path)
+        checkpoint_files.append(critic_path)
+      # Skip ONNX export on huge datasets.
+      if (
+        self._representation.actor_obs_mode == "proprio"
+        and self.motion.time_step_total <= 15_000
+      ):
+        checkpoint_files += export_actor_as_onnx(
+          actor=self.policy_learner.actor,
+          env=self.env.unwrapped,
+          path=str(staging_dir),
+          run_name=wandb.run.name,
+          term_widths=self._representation.proprio_term_widths(self._num_actions),
+        )
+    return [
+      str(checkpoint_dir / Path(path).relative_to(staging_dir))
+      for path in checkpoint_files
+    ]
+
   def run(self) -> None:
     log_dir = self._create_log_dir()
     self._init_wandb(log_dir)
 
     self.env.reset()
     self._seed_sim_history()
+    initial_files = self._save_checkpoint(log_dir / "checkpoint_0")
+    uploader = ThreadPoolExecutor(max_workers=1)
+    upload = uploader.submit(log_model_artifact, initial_files)
 
     print(f"[INFO] Starting training loop for {self.cfg.max_iterations} iterations...")
 
@@ -673,8 +727,6 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
     policy_learn_time = 0.0
     loss_dict: dict[str, torch.Tensor] = {}
     log_count = 0
-    uploader = ThreadPoolExecutor(max_workers=1)
-    upload: Future | None = None
 
     for step in range(self.cfg.max_iterations):
       num_collected_steps += self.step()
@@ -720,33 +772,11 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
         policy_learn_time = 0
         num_collected_steps = 0
 
-      if step % self.cfg.save_interval == 0:
-        assert wandb.run is not None  # _init_wandb ran before the loop
-        # The previous version must be logged before its files are overwritten.
-        if upload is not None:
-          upload.result()
-        world_model_path = str(log_dir / "world_model.pt")
-        actor_path = str(log_dir / "actor.pt")
-        torch.save(self._wm.bundle(), world_model_path)
-        torch.save(self.policy_learner.actor.state_dict(), actor_path)
-        checkpoint_files = [world_model_path, actor_path]
-        critic = getattr(self.policy_learner, "critic", None)
-        if critic is not None:
-          critic_path = str(log_dir / "critic.pt")
-          torch.save(critic.state_dict(), critic_path)
-          checkpoint_files.append(critic_path)
-        # Skip ONNX export on huge datasets.
-        if (
-          self._representation.actor_obs_mode == "proprio"
-          and self.motion.time_step_total <= 15_000
-        ):
-          checkpoint_files += export_actor_as_onnx(
-            actor=self.policy_learner.actor,
-            env=self.env.unwrapped,
-            path=str(log_dir),
-            run_name=wandb.run.name,
-            term_widths=self._representation.proprio_term_widths(self._num_actions),
-          )
+      iteration = step + 1
+      if iteration % self.cfg.save_interval == 0:
+        checkpoint_files = self._save_checkpoint(log_dir / f"checkpoint_{iteration}")
+        # Keep at most one checkpoint upload pending.
+        upload.result()
         upload = uploader.submit(log_model_artifact, checkpoint_files)
 
     uploader.shutdown()

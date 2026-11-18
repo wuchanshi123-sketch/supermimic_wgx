@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import glob
+import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,12 +20,18 @@ from mjlab.utils.torch import configure_torch_backends
 
 import supermimic.tasks  # noqa: F401
 from supermimic.runners.run_config import check_representation_matches, load_runner_cfg
-from supermimic.runners.supermimic_runner import build_actor, build_world_model
+from supermimic.runners.supermimic_runner import (
+  SuperMimicRunnerCfg,
+  build_actor,
+  build_world_model,
+)
 from supermimic.scripts.viewers import (
+  NativeViewerStartupTimeout,
   SuperMimicNativeViewer,
   SuperMimicViserViewer,
   create_wm_vis_model,
 )
+from supermimic.utils.local_checkpoints import resolve_checkpoint_actor
 from supermimic.utils.wandb_artifacts import (
   download_artifact_cached,
   download_model_dir,
@@ -33,8 +40,14 @@ from supermimic.utils.wandb_artifacts import (
 
 @dataclass
 class PlayConfig:
-  wandb_path: str
+  wandb_path: str | None = None
+  """W&B run path. Choose either this or --checkpoint."""
+  checkpoint: Path | None = None
+  """Local actor .pt file, with world_model.pt in the same directory."""
+  runner_config: Path | None = None
+  """Local runner config JSON. Defaults to the checkpoint's sibling runner_config.json."""
   motion_file: str | None = None
+  """Reference motion .npz or glob. Required when using --checkpoint."""
   initial_task: Literal["motion", "velocity"] = "motion"
   """Task selected when the viewer opens. Switch live via the GUI dropdown."""
   device: str | None = None
@@ -43,6 +56,38 @@ class PlayConfig:
 
 
 def play(task_id: str, cfg: PlayConfig) -> None:
+  if (cfg.wandb_path is None) == (cfg.checkpoint is None):
+    raise ValueError("Pass exactly one of --checkpoint and --wandb-path.")
+  if cfg.runner_config is not None and cfg.checkpoint is None:
+    raise ValueError("--runner-config requires --checkpoint.")
+
+  actor_path = cfg.checkpoint.expanduser() if cfg.checkpoint is not None else None
+  run = None
+  if actor_path is not None:
+    if cfg.motion_file is None:
+      raise ValueError("--checkpoint requires a local --motion-file.")
+    actor_path = resolve_checkpoint_actor(actor_path)
+    for path in (actor_path, actor_path.with_name("world_model.pt")):
+      if not path.is_file():
+        raise FileNotFoundError(f"Checkpoint file not found: {path}")
+
+    config_path = cfg.runner_config or actor_path.with_name("runner_config.json")
+    config_path = config_path.expanduser()
+    if cfg.runner_config is not None or config_path.is_file():
+      runner_cfg = load_runner_cfg(json.loads(config_path.read_text(encoding="utf-8")))
+    else:
+      representation = "maxcoord" if "MaxCoord" in task_id else "gencoord"
+      runner_cfg = SuperMimicRunnerCfg(representation=representation)
+      print(f"[INFO] No runner_config.json found; using {representation} defaults")
+    print(f"[INFO] Loading local checkpoint: {actor_path}")
+  else:
+    import wandb
+
+    print(f"[INFO] Connecting to WandB run: {cfg.wandb_path}")
+    run = wandb.Api().run(cfg.wandb_path)
+    runner_cfg = load_runner_cfg(run.config)
+
+  check_representation_matches(task_id, runner_cfg.representation)
   configure_torch_backends()
   device = cfg.device or ("cuda:0" if torch.cuda.is_available() else "cpu")
 
@@ -51,14 +96,6 @@ def play(task_id: str, cfg: PlayConfig) -> None:
   env_cfg.scene.num_envs = 1
   env_cfg.observations["actor"].enable_corruption = True
 
-  import wandb
-
-  print(f"[INFO] Connecting to WandB run: {cfg.wandb_path}")
-  run = wandb.Api().run(cfg.wandb_path)
-  runner_cfg = load_runner_cfg(run.config)
-  check_representation_matches(task_id, runner_cfg.representation)
-
-  motion_artifacts = [a for a in run.used_artifacts() if a.type == "motions"]
   command_term = env_cfg.commands["motion"]
   assert isinstance(command_term, MotionCommandCfg)
   motion_names: list[str] = []
@@ -73,29 +110,34 @@ def play(task_id: str, cfg: PlayConfig) -> None:
     command_term.motion_file = files
     motion_names = [Path(f).stem for f in files]
     print(f"[INFO] Using {len(files)} local motion(s)")
-  elif motion_artifacts:
-    motion_files = []
-    for artifact in motion_artifacts:
-      print(f"[INFO] Found linked motion artifact: {artifact.name}")
-      motion_files.append(str(download_artifact_cached(artifact) / "motion.npz"))
-    command_term.motion_file = (
-      motion_files if len(motion_files) > 1 else motion_files[0]
-    )
-    motion_names = [a.name.split(":")[0] for a in motion_artifacts]
-    print(f"[INFO] Loaded {len(motion_files)} motion(s)")
+  elif run is not None:
+    motion_artifacts = [a for a in run.used_artifacts() if a.type == "motions"]
+    if motion_artifacts:
+      motion_files = []
+      for artifact in motion_artifacts:
+        print(f"[INFO] Found linked motion artifact: {artifact.name}")
+        motion_files.append(str(download_artifact_cached(artifact) / "motion.npz"))
+      command_term.motion_file = (
+        motion_files if len(motion_files) > 1 else motion_files[0]
+      )
+      motion_names = [a.name.split(":")[0] for a in motion_artifacts]
+      print(f"[INFO] Loaded {len(motion_files)} motion(s)")
 
   env = RslRlVecEnvWrapper(ManagerBasedRlEnv(cfg=env_cfg, device=device))
 
   wm = build_world_model(runner_cfg, env, device)
-  representation = wm.representation
   dynamics = wm.dynamics
 
-  model_dir = download_model_dir(run)
-  wm.load_bundle(torch.load(model_dir / "world_model.pt", map_location=device))
+  if actor_path is None:
+    assert run is not None
+    actor_path = download_model_dir(run) / "actor.pt"
+  wm.load_bundle(
+    torch.load(actor_path.with_name("world_model.pt"), map_location=device)
+  )
   dynamics.eval()
 
   actor = build_actor(runner_cfg, wm, device)
-  actor.load_state_dict(torch.load(model_dir / "actor.pt", map_location=device))
+  actor.load_state_dict(torch.load(actor_path, map_location=device))
   actor.eval()
 
   wm_vis_model = create_wm_vis_model(env.unwrapped.sim.mj_model)
@@ -108,32 +150,35 @@ def play(task_id: str, cfg: PlayConfig) -> None:
   print(f"[INFO] Starting viewer: {resolved}")
 
   if resolved == "native":
-    SuperMimicNativeViewer(
+    viewer = SuperMimicNativeViewer(
       env=env,
       actor=actor,
       dynamics=dynamics,
-      representation=representation,
+      representation=wm.representation,
       wm_vis_model=wm_vis_model,
       num_steps_rollout=cfg.num_steps_rollout,
       sim_context=wm.sim_context,
       task_specs=actor.task_specs,
       initial_task=cfg.initial_task,
-    ).run()
+    )
   else:
-    SuperMimicViserViewer(
+    viewer = SuperMimicViserViewer(
       env=env,
       actor=actor,
       dynamics=dynamics,
-      representation=representation,
+      representation=wm.representation,
       wm_vis_model=wm_vis_model,
       num_steps_rollout=cfg.num_steps_rollout,
       motion_names=motion_names,
       sim_context=wm.sim_context,
       task_specs=actor.task_specs,
       initial_task=cfg.initial_task,
-    ).run()
+    )
 
-  env.close()
+  try:
+    viewer.run()
+  finally:
+    env.close()
 
 
 def main() -> None:
@@ -145,7 +190,10 @@ def main() -> None:
     config=mjlab.TYRO_FLAGS,
   )
   args = tyro.cli(PlayConfig, args=remaining_args, config=mjlab.TYRO_FLAGS)
-  play(chosen_task, args)
+  try:
+    play(chosen_task, args)
+  except NativeViewerStartupTimeout as exc:
+    raise SystemExit(str(exc)) from None
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import torch
 from rsl_rl.algorithms import PPO
@@ -17,7 +18,6 @@ from supermimic.utils.wandb_artifacts import log_model_artifact
 class PpoRunnerCfg(BaseRunnerCfg):
   max_iterations: int = 25000
   log_interval: int = 1
-  save_interval: int = 10
   # Real-env collection steps per outer iteration.
   num_collect_steps: int = 10
   # PPO Parameters
@@ -177,10 +177,25 @@ class PpoRunner(BaseRunner[PpoRunnerCfg]):
     for actor_td in actor_inputs:
       self.alg.actor.update_normalization(actor_td)
 
+  def _save_checkpoint(self, checkpoint_dir: Path) -> None:
+    with self._stage_checkpoint(checkpoint_dir) as staging_dir:
+      torch.save(self._wm.bundle(), staging_dir / "world_model.pt")
+      torch.save(
+        {
+          "actor": self.alg.actor.state_dict(),
+          "critic": self.alg.critic.state_dict(),
+        },
+        staging_dir / "actor.pt",
+      )
+    log_model_artifact(
+      [str(checkpoint_dir / name) for name in ("world_model.pt", "actor.pt")]
+    )
+
   def run(self) -> None:
-    log_dir = self._create_log_dir("ppo")
+    log_dir = self._create_log_dir()
     self._init_wandb(log_dir, name_suffix="-ppo")
     self._seed_sim_history()
+    self._save_checkpoint(log_dir / "checkpoint_0")
 
     print(f"[INFO] Starting MBPO training loop for {self.cfg.max_iterations} iters...")
 
@@ -217,17 +232,8 @@ class PpoRunner(BaseRunner[PpoRunnerCfg]):
           num_collected_steps=num_collected_steps,
         )
 
-      if (iteration + 1) % self.cfg.save_interval == 0:
-        world_model_path = str(log_dir / "world_model.pt")
-        actor_path = str(log_dir / "actor.pt")
-        torch.save(self._wm.bundle(), world_model_path)
-        torch.save(
-          {
-            "actor": self.alg.actor.state_dict(),
-            "critic": self.alg.critic.state_dict(),
-          },
-          actor_path,
-        )
-        log_model_artifact([world_model_path, actor_path])
+      completed = iteration + 1
+      if completed % self.cfg.save_interval == 0:
+        self._save_checkpoint(log_dir / f"checkpoint_{completed}")
 
     self._cleanup()
