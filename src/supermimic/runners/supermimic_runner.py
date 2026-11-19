@@ -306,12 +306,15 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
       num_envs=self.env.num_envs,
       device=self.device,
     )
-    self.world_model_learner = WorldModelLearner(
-      self._dynamics, self._representation, self.cfg.wm, device=self.device
-    )
+    self.world_model_learner = self._make_world_model_learner()
 
     self._pending_norm_updates: list[tuple] = []
     self._sim_history: torch.Tensor | None = None
+
+  def _make_world_model_learner(self) -> WorldModelLearner:
+    return WorldModelLearner(
+      self._dynamics, self._representation, self.cfg.wm, device=self.device
+    )
 
   def _seed_sim_history(self) -> None:
     """Seed the real-sim obs-history ring with the noised current sensor."""
@@ -422,6 +425,9 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
     motion_cmd = self.env.unwrapped.command_manager.get_term("motion")
     return {"motion_time": motion_cmd.time_steps.clone()}
 
+  def _transition_task_post_fields(self) -> dict[str, torch.Tensor]:
+    return {}
+
   def _init_policy(self) -> None:
     """Subclasses implement this to create their policy learner."""
     raise NotImplementedError
@@ -454,6 +460,7 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
       "action": raw_actions,
       "prev_action": prev_action,
       **task_fields,
+      **self._transition_task_post_fields(),
       "terminated": terminated,
       "truncated": truncated,
     }

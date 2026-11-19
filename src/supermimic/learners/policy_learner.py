@@ -66,6 +66,8 @@ class BpttPolicyLearner:
     wm_env: DifferentiableWorldModelEnv,
     cfg: BpttPolicyLearnerCfg,
     device: str = "cpu",
+    *,
+    capture_updates: bool = True,
   ):
     self.actor = policy
     self.wm_env = wm_env
@@ -77,7 +79,11 @@ class BpttPolicyLearner:
     self._rollout_actor = (
       torch.compile(self.actor) if torch.device(device).type == "cuda" else self.actor
     )
-    self._captured_update = CapturedUpdate(self._update_from, self._graph_state)
+    self._run_update = (
+      CapturedUpdate(self._update_from, self._graph_state)
+      if capture_updates
+      else self._update_from
+    )
 
   def update(self) -> dict[str, torch.Tensor]:
     self.actor.train()
@@ -85,7 +91,7 @@ class BpttPolicyLearner:
       module.eval()
       module.requires_grad_(False)
     starts = [self.wm_env.sample_initial_states() for _ in range(self.cfg.num_batches)]
-    return self._captured_update(torch.stack(starts))
+    return self._run_update(torch.stack(starts))
 
   def _update_from(self, starts: TensorDict) -> dict[str, torch.Tensor]:
     totals: dict[str, torch.Tensor] = {}
@@ -155,8 +161,10 @@ class ActorCriticPolicyLearner(BpttPolicyLearner):
     wm_env: DifferentiableWorldModelEnv,
     cfg: ActorCriticPolicyLearnerCfg,
     device: str = "cpu",
+    *,
+    capture_updates: bool = True,
   ):
-    super().__init__(policy, wm_env, cfg, device)
+    super().__init__(policy, wm_env, cfg, device, capture_updates=capture_updates)
     self.critic = critic
     self.critic_optimizers = build_optimizers([critic], self.cfg.lr, device=device)
     self._v_max = self.wm_env.max_step_reward / (1 - self.cfg.gamma)

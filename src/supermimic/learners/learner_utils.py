@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import functools
+import gc
 from collections.abc import Callable, Iterable, Sequence
 
 import torch
@@ -126,8 +127,16 @@ class CapturedUpdate:
         return outputs
       if self._graph is None:
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, pool=pool, stream=stream):
-          self._outputs = self._fn(self._inputs)
+        # Triton kernel finalizers can unload CUDA modules during cyclic GC,
+        # which invalidates an active capture. Restore GC before replaying.
+        gc_enabled = gc.isenabled()
+        gc.disable()
+        try:
+          with torch.cuda.graph(graph, pool=pool, stream=stream):
+            self._outputs = self._fn(self._inputs)
+        finally:
+          if gc_enabled:
+            gc.enable()
         self._graph, self._identity = graph, _identity(self._state())
       elif _identity(state) != self._identity:
         raise RuntimeError("a captured tensor moved")

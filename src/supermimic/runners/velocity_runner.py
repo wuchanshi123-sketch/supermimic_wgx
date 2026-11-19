@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -17,6 +18,7 @@ from supermimic.learners.policy_learner import (
   ActorCriticPolicyLearner,
   ActorCriticPolicyLearnerCfg,
 )
+from supermimic.learners.velocity_wm_learner import VelocityWorldModelLearner
 from supermimic.models import _CudaGraphNormalization, build_mlp
 from supermimic.replay_buffer import FieldSpec
 from supermimic.representations import GenCoordRepresentation, StateRepresentation
@@ -26,7 +28,12 @@ from supermimic.runners.supermimic_runner import (
   WorldModelRunnerCfg,
   build_world_model,
 )
-from supermimic.tasks.velocity_env_cfg import VelocityCommand
+from supermimic.tasks.velocity_env_cfg import SimVelocityReward, VelocityCommand
+from supermimic.utils.local_checkpoints import resolve_checkpoint_actor
+from supermimic.utils.velocity_collision import (
+  VELOCITY_REWARD_SIGNAL_COUNT,
+  VelocityRewardSignalModel,
+)
 
 VELOCITY_TASK_ID = "SuperMimic-GenCoord-G1-Velocity"
 
@@ -44,6 +51,8 @@ class VelocityRunnerCfg(WorldModelRunnerCfg):
   exploration_noise: float = 0.15
   """Bounded, temporally smoothed noise on raw actions during real collection."""
   action_limit: float = 3.0
+  init_checkpoint: str | None = None
+  """Local checkpoint directory supplying actor.pt and world_model.pt for a new run."""
 
   def __post_init__(self) -> None:
     if self.representation != "gencoord" or self.actor_obs != "proprio":
@@ -56,6 +65,8 @@ class VelocityRunnerCfg(WorldModelRunnerCfg):
       raise ValueError("The history length must be between 1 and buffer_size")
     if self.warmup_wm_updates < 0:
       raise ValueError("warmup_wm_updates must be non-negative")
+    if self.init_checkpoint is not None and self.wandb_run_path is not None:
+      raise ValueError("Choose either init_checkpoint or wandb_run_path")
     if self.policy.batch_size < 4 or self.policy.batch_size % 4:
       raise ValueError("The policy batch size must be a positive multiple of four")
     if not math.isfinite(self.action_limit) or self.action_limit <= 0:
@@ -92,26 +103,91 @@ class VelocityRunner(WorldModelRunner[VelocityRunnerCfg]):
     return self.cfg.warmup_wm_updates
 
   def _build_world_model(self) -> WorldModel:
-    # The velocity objective uses pelvis and joint states directly. Bind the
-    # robot's limits without the motion clip's forward-kinematics provider.
-    return build_world_model(
+    self._init_actor_path = self._initial_actor_path()
+    # Bind the robot's limits without the motion clip's kinematics provider.
+    wm = build_world_model(
       self.cfg, self.env, self.device, bind_representation=StateRepresentation.bind
     )
+    self._reward_signals = VelocityRewardSignalModel(
+      wm.representation.rep_state_dim, wm.num_actions, wm.sim_context.output_dim
+    ).to(self.device)
+    if self._init_actor_path is not None:
+      model_path = self._init_actor_path.with_name("world_model.pt")
+      bundle = torch.load(model_path, map_location="cpu", weights_only=True)
+      try:
+        for name in ("action_scale", "action_offset"):
+          current = getattr(wm.dynamics, name).detach().cpu()
+          if not torch.equal(bundle["dynamics"][name], current):
+            raise ValueError(
+              f"{model_path} uses a different {name} from the current env"
+            )
+        wm.load_bundle(bundle)
+        if "velocity_reward_model" in bundle:
+          self._reward_signals.load_checkpoint(bundle["velocity_reward_model"])
+      except (KeyError, TypeError, RuntimeError) as exc:
+        raise ValueError(
+          f"World model from {model_path} does not match the current runner"
+        ) from exc
+    return wm
+
+  def _make_world_model_learner(self) -> VelocityWorldModelLearner:
+    return VelocityWorldModelLearner(
+      self._dynamics,
+      self._representation,
+      self.cfg.wm,
+      self.device,
+      self._reward_signals,
+    )
+
+  def _initial_actor_path(self) -> Path | None:
+    if self.cfg.init_checkpoint is None:
+      return None
+    directory = Path(self.cfg.init_checkpoint).expanduser()
+    if not directory.is_dir():
+      raise FileNotFoundError(f"Velocity checkpoint directory not found: {directory}")
+    actor_path = resolve_checkpoint_actor(directory / "actor.pt")
+    for path in (actor_path, actor_path.with_name("world_model.pt")):
+      if not path.is_file():
+        raise FileNotFoundError(f"Missing velocity checkpoint file: {path}")
+
+    metadata = actor_path.with_name("runner_config.json")
+    if metadata.is_file():
+      try:
+        saved = json.loads(metadata.read_text(encoding="utf-8"))["runner_cfg"]
+        saved_limit = float(saved.get("action_limit", self.cfg.action_limit))
+      except (AttributeError, KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid velocity checkpoint config: {metadata}") from exc
+      if saved_limit != self.cfg.action_limit:
+        raise ValueError(
+          f"The saved actor uses --runner.action-limit {saved_limit:g}, "
+          f"but the current runner uses {self.cfg.action_limit:g}"
+        )
+    return actor_path
 
   def _bind_task(self) -> None:
     term = self.env.unwrapped.command_manager.get_term("twist")
     if not isinstance(term, VelocityCommand):
       raise TypeError("The velocity runner requires a VelocityCommand term named twist")
     self.velocity_command = term
+    self._sim_reward = cast(
+      SimVelocityReward, self.env.unwrapped.reward_manager.get_term_cfg("velocity").func
+    )
 
   def _task_buffer_schema(self) -> dict[str, FieldSpec]:
-    return {"velocity_command": FieldSpec(3), "command_time_left": FieldSpec()}
+    return {
+      "velocity_command": FieldSpec(3),
+      "command_time_left": FieldSpec(),
+      "velocity_reward_signals": FieldSpec(VELOCITY_REWARD_SIGNAL_COUNT),
+    }
 
   def _transition_task_fields(self) -> dict[str, torch.Tensor]:
     return {
       "velocity_command": self.velocity_command.command.clone(),
       "command_time_left": self.velocity_command.time_left.clone(),
     }
+
+  def _transition_task_post_fields(self) -> dict[str, torch.Tensor]:
+    return {"velocity_reward_signals": self._sim_reward.signals}
 
   def _init_policy(self) -> None:
     representation = cast(GenCoordRepresentation, self._representation)
@@ -121,6 +197,18 @@ class VelocityRunner(WorldModelRunner[VelocityRunnerCfg]):
       representation.rep_state_dim + self._num_goals + self._sim_context.output_dim
     )
     actor = VelocityActor(actor_dim, self._num_actions, self.cfg).to(self.device)
+    if self._init_actor_path is not None:
+      weights = torch.load(self._init_actor_path, map_location="cpu", weights_only=True)
+      try:
+        actor.load_state_dict(weights)
+      except (TypeError, RuntimeError) as exc:
+        raise ValueError(
+          f"Actor from {self._init_actor_path} does not match the current runner"
+        ) from exc
+      print(
+        f"[INFO] Initialized the velocity actor and world model from {self._init_actor_path.parent}"
+      )
+    # Start the critic fresh so it learns values for the current reward.
     critic = build_mlp(critic_dim, self.cfg.critic_hidden_dims, output_dim=1).to(
       self.device
     )
@@ -134,12 +222,18 @@ class VelocityRunner(WorldModelRunner[VelocityRunnerCfg]):
       history_length=self.cfg.history_length,
       termination_softness=self.cfg.termination_softness,
       device=self.device,
+      sim_context=self._sim_context,
+      reward_signals=self._reward_signals,
     )
     if torch.device(self.device).type == "cuda":
       self.wm_env.reset = torch.compile(self.wm_env.reset)
       self.wm_env.step = torch.compile(self.wm_env.step)
     self.policy_learner = ActorCriticPolicyLearner(
-      actor, critic, self.wm_env, self.cfg.policy, device=self.device
+      actor,
+      critic,
+      self.wm_env,
+      self.cfg.policy,
+      device=self.device,
     )
     self._action_noise = torch.zeros(
       self.env.num_envs, self._num_actions, device=self.device
@@ -168,7 +262,10 @@ class VelocityRunner(WorldModelRunner[VelocityRunnerCfg]):
         0.3,
       )
       actions = self._action_noise
-      if self._num_wm_updates >= self.policy_warmup_updates:
+      if (
+        self._init_actor_path is not None
+        or self._num_wm_updates >= self.policy_warmup_updates
+      ):
         actions = self.policy_learner.actor(actor_td) + actions
       actions = actions.clamp(-self.cfg.action_limit, self.cfg.action_limit)
 
@@ -188,7 +285,9 @@ class VelocityRunner(WorldModelRunner[VelocityRunnerCfg]):
 
   def _save_checkpoint(self, checkpoint_dir: Path) -> list[str]:
     with self._stage_checkpoint(checkpoint_dir) as staging_dir:
-      torch.save(self._wm.bundle(), staging_dir / "world_model.pt")
+      bundle = self._wm.bundle()
+      bundle["velocity_reward_model"] = self._reward_signals.state_dict()
+      torch.save(bundle, staging_dir / "world_model.pt")
       torch.save(self.policy_learner.actor.state_dict(), staging_dir / "actor.pt")
       torch.save(self.policy_learner.critic.state_dict(), staging_dir / "critic.pt")
     return [

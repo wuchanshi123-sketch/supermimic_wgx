@@ -92,6 +92,26 @@ The default limits are ±1.0 m/s forward and backward, ±1.0 m/s sideways, and
 `'(-1.0,1.0)'`. `Episode_Metrics/vx_error`, `vy_error`, and `wz_error` report
 measured tracking errors in MuJoCo.
 
+The velocity task uses the non-foot rewards from Unitree G1 Flat, plus its
+foot slip (`-0.25`) and soft landing (`-0.001`) costs. Slip penalizes the
+squared horizontal velocity of contacting feet. Soft landing penalizes force
+magnitude on first contact. Both apply when the command's planar speed plus
+absolute yaw rate exceeds `0.1`. Speed commands and episode termination
+conditions follow the SuperMimic velocity task.
+
+MuJoCo and the imagined rollouts share the reward formula. MuJoCo measures
+joint acceleration, self-collision count, foot slip and first-contact force
+directly. During training, the world model fits an auxiliary predictor for
+those signals from the collected measurements. Its weights are saved in
+`world_model.pt`. Older checkpoints restore any existing prediction weights
+and learn the newly added outputs during warm-up.
+
+To start a new run from an existing velocity policy, pass
+`--runner.init-checkpoint` with a checkpoint directory containing `actor.pt`
+and `world_model.pt`. The new run uses the saved actor during replay warm-up
+and trains a fresh critic with the current rewards. `--runner.max-iterations`
+counts iterations in the new run, which starts saving at `checkpoint_0`.
+
 Drive a local velocity actor with a Linux gamepad in the native MuJoCo window.
 
 ```bash
@@ -106,6 +126,13 @@ disconnected gamepad give a zero command. **Space** pauses or resumes, and
 **Enter** resets the robot. Use `ls -l /dev/input/by-id/*-joystick` to locate a
 stable device path. The player reads `actor.pt` directly and uses the sibling
 `runner_config.json` to recover a custom action limit when available.
+
+When `world_model.pt` is present in the same checkpoint, the window also
+shows the world model prediction as a translucent blue robot. Both robots
+receive the same gamepad command. The ghost starts from the simulator state
+and follows its own predicted state for 100 control steps (2 seconds) before
+resynchronizing. Set `--num-steps-rollout` to change that interval. **R** toggles
+the ghost with the other debug visuals. Press **Enter** to reset both robots.
 
 ## Acknowledgements
 

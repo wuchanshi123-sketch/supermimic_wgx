@@ -10,6 +10,7 @@ import torch
 from mjlab.managers import (
   CommandTerm,
   CommandTermCfg,
+  ManagerTermBase,
   MetricsTermCfg,
   ObservationGroupCfg,
   ObservationTermCfg,
@@ -27,12 +28,22 @@ from supermimic.tasks.env_cfgs import (
   root_ori,
   root_pos,
 )
-from supermimic.utils.velocity_reward import (
-  VelocityRewardCfg,
-  VelocityTerminationCfg,
-  velocity_fall_error,
-  velocity_reward,
+from supermimic.utils.unitree_velocity_reward import (
+  UnitreeVelocityPosture,
+  UnitreeVelocityRewardCfg,
+  unitree_g1_home_joint_pos,
+  unitree_velocity_reward,
 )
+from supermimic.utils.velocity_collision import (
+  VELOCITY_REWARD_SIGNAL_COUNT,
+  self_collision_count,
+  self_collision_sensor_cfg,
+)
+from supermimic.utils.velocity_feet import (
+  VelocityFootCosts,
+  foot_ground_contact_sensor_cfg,
+)
+from supermimic.utils.velocity_reward import VelocityTerminationCfg, velocity_fall_error
 
 if TYPE_CHECKING:
   from mjlab.envs import ManagerBasedRlEnv, ManagerBasedRlEnvCfg
@@ -155,16 +166,96 @@ def _pelvis_rep_state(env: ManagerBasedRlEnv) -> torch.Tensor:
   )
 
 
-def sim_velocity_reward(env: ManagerBasedRlEnv, cfg: VelocityRewardCfg) -> torch.Tensor:
-  """Evaluate the shared reward rate on MuJoCo's post-physics state."""
-  return velocity_reward(
-    _pelvis_rep_state(env),
-    _velocity_command(env),
-    env.action_manager.action,
-    env.action_manager.prev_action,
-    env.scene["robot"].data.soft_joint_pos_limits,
-    cfg,
-  )
+class SimVelocityReward(ManagerTermBase):
+  """Evaluate the same pose and velocity objectives in MuJoCo and imagination."""
+
+  def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRlEnv) -> None:
+    del cfg
+    super().__init__(env)
+    robot = env.scene["robot"]
+    self._torso_id = robot.body_names.index("torso_link")
+    self._posture = UnitreeVelocityPosture(
+      robot.joint_names,
+      unitree_g1_home_joint_pos(robot.joint_names, robot.data.default_joint_pos[0]),
+    )
+    self._foot_costs = VelocityFootCosts(env)
+    self.signals = torch.zeros(
+      env.num_envs, VELOCITY_REWARD_SIGNAL_COUNT, device=env.device
+    )
+    self._evaluate_sim = (
+      torch.compile(self.evaluate)
+      if torch.device(env.device).type == "cuda"
+      else self.evaluate
+    )
+
+  def __call__(
+    self, env: ManagerBasedRlEnv, cfg: UnitreeVelocityRewardCfg
+  ) -> torch.Tensor:
+    robot = env.scene["robot"].data
+    joint_acc_l2 = robot.joint_acc.square().sum(dim=-1)
+    collision_count = self_collision_count(env)
+    foot_slip, soft_landing = self._foot_costs()
+    # RewardManager calls this before auto-reset clears acceleration and contact history.
+    self.signals.copy_(
+      torch.nan_to_num(
+        torch.stack((joint_acc_l2, collision_count, foot_slip, soft_landing), dim=-1),
+        posinf=0.0,
+      )
+    )
+    torso_quat = robot.body_link_quat_w[:, self._torso_id]
+    torso_omega = robot.body_link_ang_vel_w[:, self._torso_id]
+    return self._evaluate_sim(
+      _pelvis_rep_state(env),
+      _velocity_command(env),
+      env.action_manager.action,
+      env.action_manager.prev_action,
+      robot.soft_joint_pos_limits,
+      cfg,
+      torso_tilt_error=2.0 * torso_quat[:, 1:3].square().sum(dim=-1),
+      torso_roll_pitch_speed_sq=torso_omega[:, :2].square().sum(dim=-1),
+      joint_acc_l2=joint_acc_l2,
+      angular_momentum_l2=env.scene["robot/root_angmom"].data.square().sum(dim=-1),
+      self_collision_count=collision_count,
+      foot_slip=foot_slip,
+      soft_landing=soft_landing,
+      terminated=env.termination_manager.terminated,
+    )
+
+  def evaluate(
+    self,
+    rep_state: torch.Tensor,
+    command: torch.Tensor,
+    action: torch.Tensor,
+    last_action: torch.Tensor,
+    joint_limits: torch.Tensor,
+    cfg: UnitreeVelocityRewardCfg,
+    *,
+    torso_tilt_error: torch.Tensor,
+    torso_roll_pitch_speed_sq: torch.Tensor,
+    joint_acc_l2: torch.Tensor,
+    angular_momentum_l2: torch.Tensor,
+    self_collision_count: torch.Tensor,
+    foot_slip: torch.Tensor,
+    soft_landing: torch.Tensor,
+    terminated: torch.Tensor,
+  ) -> torch.Tensor:
+    return unitree_velocity_reward(
+      rep_state,
+      command,
+      action,
+      last_action,
+      joint_limits,
+      cfg,
+      posture=self._posture,
+      torso_tilt_error=torso_tilt_error,
+      torso_roll_pitch_speed_sq=torso_roll_pitch_speed_sq,
+      joint_acc_l2=joint_acc_l2,
+      angular_momentum_l2=angular_momentum_l2,
+      self_collision_count=self_collision_count,
+      foot_slip=foot_slip,
+      soft_landing=soft_landing,
+      terminated=terminated,
+    )
 
 
 def sim_velocity_fall(
@@ -208,7 +299,7 @@ def velocity_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   }
   cfg.rewards = {
     "velocity": RewardTermCfg(
-      func=sim_velocity_reward, weight=1.0, params={"cfg": VelocityRewardCfg()}
+      func=SimVelocityReward, weight=1.0, params={"cfg": UnitreeVelocityRewardCfg()}
     )
   }
   cfg.terminations = {
@@ -227,5 +318,5 @@ def velocity_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   }
   cfg.events["reset_robot_joints"].params["position_range"] = (-0.02, 0.02)
   cfg.curriculum = {}
-  cfg.scene.sensors = ()
+  cfg.scene.sensors = (self_collision_sensor_cfg(), foot_ground_contact_sensor_cfg())
   return cfg

@@ -11,12 +11,14 @@ from mjlab.managers import RewardManager
 from mjlab.utils.lab_api.math import quat_apply_inverse
 from tensordict import TensorDict
 
+from supermimic.envs import velocity_world_model_env as velocity_imagination
 from supermimic.envs.velocity_world_model_env import VelocityWorldModelEnv
 from supermimic.replay_buffer import ReplayBuffer
 from supermimic.representations import create_representation
 from supermimic.runners.supermimic_runner import BaseRunner
 from supermimic.runners.velocity_runner import VelocityRunner
 from supermimic.scripts import train
+from supermimic.tasks import velocity_env_cfg as velocity_task
 from supermimic.tasks.env_cfgs import gencoord_env_cfg, maxcoord_env_cfg
 from supermimic.tasks.velocity_env_cfg import (
   VelocityCommandCfg,
@@ -85,6 +87,10 @@ def test_velocity_config_keeps_tracking_configs_separate():
     tracking.observations["full_state"].terms
   )
   assert {"reset_base", "reset_robot_joints"} <= velocity.events.keys()
+  assert {sensor.name for sensor in velocity.scene.sensors} == {
+    "self_collision",
+    "feet_ground_contact",
+  }
   assert "motion_end" not in velocity.terminations
   assert "command_vel" not in velocity.curriculum
   for cfg in (tracking, maxcoord):
@@ -144,7 +150,7 @@ def test_train_routes_velocity_separately_from_motion_tasks(
 
 @pytest.mark.parametrize(("history_length", "scale_by_dt"), [(1, True), (3, False)])
 def test_imagined_step_uses_pre_switch_command_and_matches_simulator_reward(
-  history_length, scale_by_dt
+  monkeypatch, history_length, scale_by_dt
 ):
   representation = _representation()
   cfg = velocity_env_cfg()
@@ -153,12 +159,48 @@ def test_imagined_step_uses_pre_switch_command_and_matches_simulator_reward(
   cfg.commands["twist"] = replace(
     cfg.commands["twist"], standing_fraction=1.0, single_axis_fraction=0.0
   )
+
+  # The real MJCF-derived torso kinematics have their own validation. Keep this
+  # test focused on the reward manager and imagined-step input contract.
+  def torso_state(rep_state, root_quat_w):
+    return 2.0 * root_quat_w[..., 1:3].square().sum(-1), rep_state[..., 4].square()
+
+  joint_acc = torch.linspace(10.0, 50.0, NUM_JOINTS).expand(NUM_ENVS, NUM_JOINTS)
+  collision_count = torch.tensor([1.0, 1.0, 0.0, 2.0])
+  foot_slip = torch.tensor([0.4, 0.4, 0.1, 2.0])
+  soft_landing = torch.tensor([150.0, 150.0, 50.0, 400.0])
+  reward_signals = torch.stack(
+    (joint_acc.square().sum(-1), collision_count, foot_slip, soft_landing), dim=-1
+  )
+  monkeypatch.setattr(
+    velocity_imagination, "VelocityTorsoKinematics", lambda _: torso_state
+  )
+  monkeypatch.setattr(
+    velocity_imagination,
+    "VelocityAngularMomentum",
+    lambda _: lambda rep_state, _com: rep_state[..., 4:7].square().sum(-1),
+  )
+  monkeypatch.setattr(velocity_task, "self_collision_count", lambda _: collision_count)
+  monkeypatch.setattr(
+    velocity_task, "VelocityFootCosts", lambda _: lambda: (foot_slip, soft_landing)
+  )
   limits = torch.tensor([-1.0, 1.0]).expand(NUM_ENVS, NUM_JOINTS, 2)
-  robot = SimpleNamespace(data=SimpleNamespace(soft_joint_pos_limits=limits))
+  joint_names = ["left_hip_pitch_joint", *(f"wrist_{i}" for i in range(1, NUM_JOINTS))]
+  robot = SimpleNamespace(
+    joint_names=joint_names,
+    body_names=["torso_link"],
+    data=SimpleNamespace(
+      soft_joint_pos_limits=limits,
+      default_joint_pos=torch.full((NUM_ENVS, NUM_JOINTS), 0.1),
+    ),
+  )
   scene = _Scene(robot=robot)
-  sim = SimpleNamespace(cfg=cfg, scene=scene, step_dt=DT)
+  sim = SimpleNamespace(
+    cfg=cfg, scene=scene, step_dt=DT, device="cpu", num_envs=NUM_ENVS
+  )
   sim.unwrapped = sim
   sim.num_actions = NUM_JOINTS
+  sim.reward_manager = RewardManager(cfg.rewards, sim, scale_by_dt=scale_by_dt)
   simulator = VelocityWorldModelEnv(
     dynamics=_ForwardVelocityDynamics(),
     representation=representation,
@@ -167,8 +209,11 @@ def test_imagined_step_uses_pre_switch_command_and_matches_simulator_reward(
     replay_buffer=None,
     history_length=history_length,
     termination_softness=0.05,
+    sim_context=SimpleNamespace(find=lambda _: None),
+    reward_signals=lambda *_: reward_signals,
   )
   command = torch.tensor([0.55, 0.0, 0.0]).repeat(NUM_ENVS, 1)
+  command[-1] = 0.0
   time_left = torch.tensor([DT / 2, 1.0, 1.0, 1.0])
   previous = torch.full((NUM_ENVS, NUM_JOINTS), 0.05)
   batch = TensorDict(
@@ -213,33 +258,47 @@ def test_imagined_step_uses_pre_switch_command_and_matches_simulator_reward(
     full_state
   )
   gravity_w = root_pos.new_tensor([0.0, 0.0, -1.0]).expand_as(root_pos)
+  lin_vel_b = quat_apply_inverse(root_quat, lin_vel_w)
+  torso_omega = torch.zeros_like(lin_vel_b)
+  torso_omega[..., 0] = lin_vel_b[..., 0]
   robot.data = SimpleNamespace(
     root_link_pos_w=root_pos,
     root_link_quat_w=root_quat,
     root_link_lin_vel_w=lin_vel_w,
     root_link_ang_vel_w=ang_vel_w,
-    root_link_lin_vel_b=quat_apply_inverse(root_quat, lin_vel_w),
+    root_link_lin_vel_b=lin_vel_b,
     root_link_ang_vel_b=quat_apply_inverse(root_quat, ang_vel_w),
     projected_gravity_b=quat_apply_inverse(root_quat, gravity_w),
+    body_link_quat_w=root_quat.unsqueeze(-2),
+    body_link_ang_vel_w=torso_omega.unsqueeze(-2),
     joint_pos=joint_pos,
     joint_vel=joint_vel,
+    joint_acc=joint_acc,
     soft_joint_pos_limits=limits,
   )
+  scene["robot/root_angmom"] = SimpleNamespace(data=lin_vel_b)
   torch.testing.assert_close(lin_vel_w[:2, 1], torch.full((2,), 0.3))
-  sim.device = "cpu"
-  sim.num_envs = NUM_ENVS
   sim.command_manager = SimpleNamespace(
     get_term=lambda _: SimpleNamespace(command=command)
   )
   sim.action_manager = SimpleNamespace(action=action.detach(), prev_action=previous)
-  actual_reward = RewardManager(cfg.rewards, sim, scale_by_dt=scale_by_dt).compute(
-    dt=DT
-  )
-  torch.testing.assert_close(predicted_reward, actual_reward)
   fall = cfg.terminations["fall"]
   actual_fall = fall.func(sim, **fall.params)
   torch.testing.assert_close(actual_fall, torch.tensor([False, False, True, True]))
   torch.testing.assert_close(term_prob >= 0.5, actual_fall)
+  sim.termination_manager = SimpleNamespace(terminated=actual_fall)
+  actual_reward = sim.reward_manager.compute(dt=DT)
+  torch.testing.assert_close(
+    sim.reward_manager.get_term_cfg("velocity").func.signals, reward_signals
+  )
+  term = cfg.rewards["velocity"]
+  fall_cost = (
+    term.params["cfg"].terminated_cost * term.weight * (DT if scale_by_dt else 1.0)
+  )
+  # The same cost is charged on a hard fall in MuJoCo and on the expected fall
+  # indicator in the differentiable rollout.
+  expected_reward = actual_reward + fall_cost * (actual_fall.float() - term_prob)
+  torch.testing.assert_close(predicted_reward, expected_reward)
 
   predicted_reward.sum().backward()
   assert action.grad is not None and torch.isfinite(action.grad).all()
@@ -276,10 +335,13 @@ def test_velocity_replay_snapshots_command_before_step_and_keeps_continuous_wind
   runner.velocity_command = SimpleNamespace(command=command, time_left=countdown)
   actions = torch.zeros(NUM_ENVS, NUM_JOINTS)
   runner.action_manager = SimpleNamespace(action=actions)
+  runner._sim_reward = SimpleNamespace(signals=torch.zeros(NUM_ENVS, 4))
+  first_step_signals = torch.tensor([10.0, 1.0, 2.0, 300.0])
 
   def step(_actions):
     command.add_(1)
     countdown.add_(1)
+    runner._sim_reward.signals.add_(first_step_signals)
     return {}, torch.zeros(NUM_ENVS), torch.zeros(NUM_ENVS, dtype=torch.bool), {}
 
   runner.env = SimpleNamespace(num_envs=NUM_ENVS, step=step)
@@ -297,4 +359,8 @@ def test_velocity_replay_snapshots_command_before_step_and_keeps_continuous_wind
   )
   torch.testing.assert_close(
     frames["command_time_left"], torch.tensor([DT, 1 + DT]).expand(2, 2)
+  )
+  torch.testing.assert_close(
+    frames["velocity_reward_signals"],
+    torch.stack((first_step_signals, 2.0 * first_step_signals)).expand(2, 2, 4),
   )
