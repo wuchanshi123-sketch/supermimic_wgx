@@ -1,18 +1,4 @@
-"""Differentiable world model environment for motion tracking.
-
-Replaces the physics simulator with a learned ``Dynamics`` + ``StateRepresentation``
-while a reference motion clip supplies per-frame goals. Follows a template-method
-pattern inspired by mjlab's ManagerBasedRlEnv:
-
-  reset()  →  _on_reset()  →  get_observations()
-  step()   →  _wm_step()  →  _compute_commands()  →  get_observations()
-
-``_wm_step`` bundles dynamics + termination + reward for one env step. The env
-holds state only after ``reset()``. Subclasses implement only
-``get_observations``, whose actor keys are the one thing that differs between a
-single-actor policy and the multi-encoder actor, and may override
-``_build_task_goals`` to emit extra per-task goal tensors.
-"""
+"""Differentiable rollout environments using the learned dynamics model."""
 
 from __future__ import annotations
 
@@ -29,13 +15,8 @@ if TYPE_CHECKING:
   from supermimic.representations import StateRepresentation
 
 
-class WorldModelEnv(ABC):
-  """Differentiable world model env for motion tracking.
-
-  Owns the reference-motion buffers, the bundled ``_wm_step``, goal updates,
-  and the reset/observation plumbing. ``get_observations`` is the only abstract
-  method; subclasses choose how to assemble the actor observation.
-  """
+class DifferentiableWorldModelEnv(ABC):
+  """Task-independent rollout state, replay warm starts and sensor history."""
 
   def __init__(
     self,
@@ -55,29 +36,17 @@ class WorldModelEnv(ABC):
     self.replay_buffer = replay_buffer
     self.history_length = history_length
 
-    # Analytic per-step reward ceiling: positive tracking-reward weights, dt-scaled.
+    # Analytic per-step reward ceiling: positive reward weights, dt-scaled.
     self.max_step_reward = env.unwrapped.step_dt * sum(
       term.weight for term in env.cfg.rewards.values() if term.weight > 0.0
     )
 
-    # Reference-motion buffers.
     self._num_actions = env.num_actions
-    motion_cmd = env.unwrapped.command_manager.get_term("motion")
-    self.motion = motion_cmd.motion
-    self._anchor_index = motion_cmd.motion_anchor_body_index
-
     if termination_softness <= 0.0:
       raise ValueError(
         f"termination_softness must be positive, got {termination_softness}"
       )
-    terms = env.cfg.terminations
     self._termination_softness = termination_softness
-    self._anchor_pos_threshold = terms["anchor_pos"].params["threshold"]
-    self._anchor_ori_threshold = terms["anchor_ori"].params["threshold"]
-
-  # ------------------------------------------------------------------
-  # Subclass surface
-  # ------------------------------------------------------------------
 
   @abstractmethod
   def get_observations(self) -> TensorDict:
@@ -85,12 +54,24 @@ class WorldModelEnv(ABC):
     actor's input keys."""
     ...
 
-  def _build_task_goals(self) -> None:  # noqa: B027
-    """Build extra per-task goal tensors after a goal update. Default: none."""
+  @abstractmethod
+  def _wm_step(
+    self,
+    rep_state: torch.Tensor,
+    aux_state: torch.Tensor,
+    action: torch.Tensor,
+    last_action: torch.Tensor,
+    sim_ctx: torch.Tensor,
+  ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return the next aux, representation and joint states, fall probability and reward."""
 
-  # ------------------------------------------------------------------
-  # Template methods
-  # ------------------------------------------------------------------
+  @abstractmethod
+  def _on_reset(self, batch: TensorDict) -> None:
+    """Initialize task goals and sensor history from a replay snapshot."""
+
+  @abstractmethod
+  def _compute_commands(self) -> None:
+    """Advance task goals after scoring the transition."""
 
   @property
   def num_actions(self) -> int:
@@ -155,6 +136,87 @@ class WorldModelEnv(ABC):
     if self.history_length == 1:
       return latest
     return torch.cat([self._past_sensors, latest], dim=1)
+
+  def _reset_sensor_history(self, batch: TensorDict) -> None:
+    if self.history_length > 1:
+      self._past_sensors = self._warmstart_past_sensors(
+        batch["sensor_window"], batch["pad_mask"]
+      )
+    self._latest_sensor = self._synth_sensor()
+
+  def sample_initial_states(self) -> TensorDict:
+    """Sample initial state snapshots from the replay buffer.
+
+    With history_length > 1 the warm start draws the init state 1-step
+    (H-independent) and keeps its real in-episode predecessors to seed the ring:
+    ``sensor_window`` holds the H sensor frames ending at the init state, and
+    ``pad_mask`` flags its clamp-padded slots.
+    """
+    if self.history_length == 1:
+      return self.replay_buffer.sample(1, self.num_envs).squeeze(1)
+    window, padded = self.replay_buffer.sample_causal(
+      self.history_length, self.num_envs
+    )
+    batch = window[:, -1]
+    batch["sensor_window"] = window["actor_obs"]
+    batch["pad_mask"] = padded
+    return batch
+
+  def _warmstart_past_sensors(
+    self, sensor_window: torch.Tensor, pad_mask: torch.Tensor
+  ) -> torch.Tensor:
+    """Noise the sampled predecessor window; clamp-padded slots (before the
+    episode start) share the oldest real frame's single noise realization, the
+    way the real-sim ring's reset padding does."""
+    noisy = self.representation.add_proprio_noise(sensor_window[:, :-1])
+    pad = pad_mask[:, :-1]  # padding is a leading run (sample_causal)
+    first_real = (~pad).int().argmax(dim=1)
+    shared = noisy[torch.arange(self.num_envs, device=self.device), first_real]
+    return torch.where(pad.unsqueeze(-1), shared.unsqueeze(1), noisy)
+
+  def _unpack_initial_states(
+    self, batch: TensorDict
+  ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Extract (aux_state, rep_state) from a sampled batch."""
+    full_states = batch["state"]
+    aux_state = self.representation.extract_aux_state(full_states)
+    rep_state = self.representation.represent(full_states)
+    return aux_state.detach(), rep_state.detach()
+
+
+class WorldModelEnv(DifferentiableWorldModelEnv):
+  """Differentiable rollout for policies following reference motion."""
+
+  def __init__(
+    self,
+    dynamics: Dynamics,
+    representation: StateRepresentation,
+    env: Any,
+    batch_size: int,
+    replay_buffer: ReplayBuffer,
+    history_length: int,
+    termination_softness: float,
+    device: str = "cpu",
+  ) -> None:
+    super().__init__(
+      dynamics,
+      representation,
+      env,
+      batch_size,
+      replay_buffer,
+      history_length,
+      termination_softness,
+      device,
+    )
+    motion_cmd = env.unwrapped.command_manager.get_term("motion")
+    self.motion = motion_cmd.motion
+    self._anchor_index = motion_cmd.motion_anchor_body_index
+    terms = env.cfg.terminations
+    self._anchor_pos_threshold = terms["anchor_pos"].params["threshold"]
+    self._anchor_ori_threshold = terms["anchor_ori"].params["threshold"]
+
+  def _build_task_goals(self) -> None:  # noqa: B027
+    """Build extra per-task goal tensors after a goal update. Default: none."""
 
   def _critic_obs(self) -> torch.Tensor:
     """The privileged critic input — full WM state, not the actor's sensor obs."""
@@ -222,11 +284,7 @@ class WorldModelEnv(ABC):
     """Seed motion times from the sampled batch and refresh goals."""
     self.motion_times = batch["motion_time"]
     self._update_goal()
-    if self.history_length > 1:
-      self._past_sensors = self._warmstart_past_sensors(
-        batch["sensor_window"], batch["pad_mask"]
-      )
-    self._latest_sensor = self._synth_sensor()
+    self._reset_sensor_history(batch)
 
   def _compute_commands(self) -> None:
     """Advance the reference clip one frame (clamped at clip ends) and refresh."""
@@ -245,46 +303,3 @@ class WorldModelEnv(ABC):
       self.motion, self.motion_times, self.aux_state
     )
     self._build_task_goals()
-
-  # ------------------------------------------------------------------
-  # Shared helpers
-  # ------------------------------------------------------------------
-
-  def sample_initial_states(self) -> TensorDict:
-    """Sample initial state snapshots from the replay buffer.
-
-    With history_length > 1 the warm start draws the init state 1-step
-    (H-independent) and keeps its real in-episode predecessors to seed the ring:
-    ``sensor_window`` holds the H sensor frames ending at the init state, and
-    ``pad_mask`` flags its clamp-padded slots.
-    """
-    if self.history_length == 1:
-      return self.replay_buffer.sample(1, self.num_envs).squeeze(1)
-    window, padded = self.replay_buffer.sample_causal(
-      self.history_length, self.num_envs
-    )
-    batch = window[:, -1]
-    batch["sensor_window"] = window["actor_obs"]
-    batch["pad_mask"] = padded
-    return batch
-
-  def _warmstart_past_sensors(
-    self, sensor_window: torch.Tensor, pad_mask: torch.Tensor
-  ) -> torch.Tensor:
-    """Noise the sampled predecessor window; clamp-padded slots (before the
-    episode start) share the oldest real frame's single noise realization, the
-    way the real-sim ring's reset padding does."""
-    noisy = self.representation.add_proprio_noise(sensor_window[:, :-1])
-    pad = pad_mask[:, :-1]  # padding is a leading run (sample_causal)
-    first_real = (~pad).int().argmax(dim=1)
-    shared = noisy[torch.arange(self.num_envs, device=self.device), first_real]
-    return torch.where(pad.unsqueeze(-1), shared.unsqueeze(1), noisy)
-
-  def _unpack_initial_states(
-    self, batch: TensorDict
-  ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Extract (aux_state, rep_state) from a sampled batch."""
-    full_states = batch["state"]
-    aux_state = self.representation.extract_aux_state(full_states)
-    rep_state = self.representation.represent(full_states)
-    return aux_state.detach(), rep_state.detach()

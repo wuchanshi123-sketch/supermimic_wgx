@@ -13,6 +13,10 @@ class FieldSpec:
     return (num_envs, buffer_size, self.dim) if self.dim else (num_envs, buffer_size)
 
 
+class NoValidReplaySequenceError(RuntimeError):
+  """No filled contiguous trajectory is long enough for the requested sample."""
+
+
 class ReplayBuffer:
   """Per-env circular buffer over a TensorDict, with env-stratified window sampling."""
 
@@ -113,7 +117,7 @@ class ReplayBuffer:
     csum = valid.cumsum(dim=1, dtype=torch.long)
     total = csum[:, -1]
     if not (total > 0).any():
-      raise RuntimeError(f"no valid sequences L={L} n={n}")
+      raise NoValidReplaySequenceError(f"no valid sequences L={L} n={n}")
     env_idx = torch.multinomial((total > 0).float(), B, replacement=True)
     u = (torch.rand(B, device=dev) * total[env_idx].float()).long()
     age_start = torch.searchsorted(csum[env_idx], u[:, None], right=True).squeeze(-1)

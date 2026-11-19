@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import mjlab.tasks  # noqa: F401
 import tyro
@@ -12,11 +12,17 @@ from mjlab.tasks.registry import list_tasks, load_env_cfg
 
 import supermimic.tasks  # noqa: F401
 from supermimic.runners.supermimic_runner import SuperMimicRunner, SuperMimicRunnerCfg
+from supermimic.runners.velocity_runner import (
+  VELOCITY_TASK_ID,
+  VelocityRunner,
+  VelocityRunnerCfg,
+)
 from supermimic.scripts.train_utils import (
   create_env,
   download_registry_motions,
   setup_device,
 )
+from supermimic.tasks.velocity_env_cfg import velocity_env_cfg
 
 
 @dataclass
@@ -41,13 +47,16 @@ class TrainConfig:
 
 def main() -> None:
   # Parse first argument to choose the task.
-  all_tasks = list_tasks()
+  all_tasks = sorted([*list_tasks(), VELOCITY_TASK_ID])
   chosen_task, remaining_args = tyro.cli(
     tyro.extras.literal_type_from_choices(all_tasks),
     add_help=False,
     return_unknown_args=True,
     config=mjlab.TYRO_FLAGS,
   )
+  if chosen_task == VELOCITY_TASK_ID:
+    train_velocity(remaining_args)
+    return
   args = tyro.cli(
     TrainConfig,
     args=remaining_args,
@@ -94,6 +103,22 @@ def main() -> None:
   )
 
   runner.run()
+
+
+@dataclass
+class VelocityTrainConfig:
+  env: ManagerBasedRlEnvCfg = field(default_factory=velocity_env_cfg)
+  runner: VelocityRunnerCfg = field(default_factory=VelocityRunnerCfg)
+  num_envs: int = 2048
+  device: str | None = None
+
+
+def train_velocity(remaining_args: list[str]) -> None:
+  args = tyro.cli(VelocityTrainConfig, args=remaining_args, config=mjlab.TYRO_FLAGS)
+  device = setup_device(args.device)
+  print(f"[INFO] Loading environment: {VELOCITY_TASK_ID}")
+  env = create_env(args.env, args.num_envs, device)
+  VelocityRunner(env, args.runner, task_id=VELOCITY_TASK_ID, device=device).run()
 
 
 if __name__ == "__main__":

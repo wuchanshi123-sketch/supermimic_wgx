@@ -25,12 +25,15 @@ from supermimic.runners.supermimic_runner import (
   build_actor,
   build_world_model,
 )
+from supermimic.runners.velocity_runner import VELOCITY_TASK_ID
+from supermimic.scripts.play_velocity import VelocityPlayConfig, play_velocity
 from supermimic.scripts.viewers import (
   NativeViewerStartupTimeout,
   SuperMimicNativeViewer,
   SuperMimicViserViewer,
   create_wm_vis_model,
 )
+from supermimic.utils.gamepad import GamepadError
 from supermimic.utils.local_checkpoints import resolve_checkpoint_actor
 from supermimic.utils.wandb_artifacts import (
   download_artifact_cached,
@@ -182,13 +185,27 @@ def play(task_id: str, cfg: PlayConfig) -> None:
 
 
 def main() -> None:
-  all_tasks = list_tasks()
+  all_tasks = sorted([*list_tasks(), VELOCITY_TASK_ID])
   chosen_task, remaining_args = tyro.cli(
     tyro.extras.literal_type_from_choices(all_tasks),
     add_help=False,
     return_unknown_args=True,
     config=mjlab.TYRO_FLAGS,
   )
+  if chosen_task == VELOCITY_TASK_ID:
+    args = tyro.cli(VelocityPlayConfig, args=remaining_args, config=mjlab.TYRO_FLAGS)
+    try:
+      play_velocity(args)
+    except (
+      GamepadError,
+      NativeViewerStartupTimeout,
+      FileNotFoundError,
+      ValueError,
+    ) as exc:
+      raise SystemExit(str(exc)) from None
+    except KeyboardInterrupt:
+      return
+    return
   args = tyro.cli(PlayConfig, args=remaining_args, config=mjlab.TYRO_FLAGS)
   try:
     play(chosen_task, args)

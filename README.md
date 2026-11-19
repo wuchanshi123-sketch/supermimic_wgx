@@ -71,6 +71,42 @@ Press **Space** to pause or resume, **Enter** to reset, and **Right Arrow** to
 advance one step while paused. Omit `--device cpu` to use CUDA when available.
 Use `--viewer viser` to play in a browser.
 
+### G1 velocity following
+
+`SuperMimic-GenCoord-G1-Velocity` learns to follow sampled forward, lateral, and
+yaw-rate commands on flat ground. It uses the differentiable world model and
+its actor-critic learner. Training starts from the G1 standing pose and
+collects its own MuJoCo data.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 uv run src/supermimic/scripts/train.py \
+  SuperMimic-GenCoord-G1-Velocity --num-envs 2048 \
+  --runner.run-name supermimic_g1_velocity --runner.max-iterations 100000 \
+  --env.sim.mujoco.iterations 50 --env.sim.mujoco.ls-iterations 50
+```
+
+The default limits are ±1.0 m/s forward and backward, ±1.0 m/s sideways, and
+±3.0 rad/s in yaw. Set the ranges with
+`--env.commands.twist.lin-vel-x`, `--env.commands.twist.lin-vel-y`, and
+`--env.commands.twist.ang-vel-z`; pass each range as a quoted tuple, such as
+`'(-1.0,1.0)'`. `Episode_Metrics/vx_error`, `vy_error`, and `wz_error` report
+measured tracking errors in MuJoCo.
+
+Drive a local velocity actor with a Linux gamepad in the native MuJoCo window.
+
+```bash
+uv run src/supermimic/scripts/play.py SuperMimic-GenCoord-G1-Velocity \
+  --checkpoint "logs/SuperMimic-GenCoord-G1-Velocity/<run-timestamp>/actor.pt" \
+  --gamepad-device /dev/input/js1
+```
+
+The left stick controls forward/backward and lateral velocity (both ±1.0 m/s).
+The right stick controls yaw rate (±3.0 rad/s). Centered sticks and a
+disconnected gamepad give a zero command. **Space** pauses or resumes, and
+**Enter** resets the robot. Use `ls -l /dev/input/by-id/*-joystick` to locate a
+stable device path. The player reads `actor.pt` directly and uses the sibling
+`runner_config.json` to recover a custom action limit when available.
+
 ## Acknowledgements
 
 SuperMimic contains code inspired by these projects:

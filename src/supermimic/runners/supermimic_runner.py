@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
@@ -28,7 +28,7 @@ from supermimic.learners.policy_learner import (
 )
 from supermimic.learners.wm_learner import WorldModelLearner, WorldModelLearnerCfg
 from supermimic.models import Dynamics, MultiEncoderAE, build_mlp
-from supermimic.replay_buffer import FieldSpec, ReplayBuffer
+from supermimic.replay_buffer import FieldSpec, NoValidReplaySequenceError, ReplayBuffer
 from supermimic.representations import StateRepresentation, create_representation
 from supermimic.runners.exporter import export_actor_as_onnx
 from supermimic.runners.reset_sampling import ReturnSampler, ReturnSamplerCfg
@@ -73,9 +73,13 @@ ActorCriticCfg = Annotated[
 
 
 @dataclass
-class SuperMimicRunnerCfg(BaseRunnerCfg):
+class WorldModelRunnerCfg(BaseRunnerCfg):
   max_iterations: int = 1000000
   replay_ratio: int = 16
+
+
+@dataclass
+class SuperMimicRunnerCfg(WorldModelRunnerCfg):
   latent_dim: int = 32
   actor_hidden_dims: tuple[int, ...] = (2048, 1024, 512, 256)
   critic_hidden_dims: tuple[int, ...] = (256, 128)
@@ -121,7 +125,13 @@ class WorldModel:
     self.sim_context.load_state_dict(bundle["sim_context"])
 
 
-def build_world_model(cfg: BaseRunnerCfg, env, device: str) -> WorldModel:
+def build_world_model(
+  cfg: BaseRunnerCfg,
+  env,
+  device: str,
+  *,
+  bind_representation: Callable[..., None] | None = None,
+) -> WorldModel:
   """Construct the representation and dynamics for ``env`` sized by ``cfg``.
 
   Resets ``env`` to read its observation dimensions.
@@ -154,7 +164,10 @@ def build_world_model(cfg: BaseRunnerCfg, env, device: str) -> WorldModel:
     actor_obs_mode=cfg.actor_obs,
   ).to(device)
 
-  representation.bind(env.unwrapped, sim_context)
+  if bind_representation is None:
+    representation.bind(env.unwrapped, sim_context)
+  else:
+    bind_representation(representation, env.unwrapped, sim_context)
 
   print(
     f"[INFO] Representation: {cfg.representation} "
@@ -265,8 +278,15 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
       device=device,
     )
 
+  def _build_world_model(self) -> WorldModel:
+    return build_world_model(self.cfg, self.env, self.device)
+
+  def _bind_task(self) -> None:
+    self.motion_cmd = self.env.unwrapped.command_manager.get_term("motion")
+    self.motion = self.motion_cmd.motion
+
   def _init_common(self) -> None:
-    wm = build_world_model(self.cfg, self.env, self.device)
+    wm = self._build_world_model()
     self._wm = wm
     self._representation = wm.representation
     self._dynamics = wm.dynamics
@@ -278,8 +298,7 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
       load_wandb_checkpoint(self.cfg.wandb_run_path, wm, self.device)
 
     self.action_manager = self.env.unwrapped.action_manager
-    self.motion_cmd = self.env.unwrapped.command_manager.get_term("motion")
-    self.motion = self.motion_cmd.motion
+    self._bind_task()
 
     self.replay_buffer = ReplayBuffer(
       schema=self._buffer_schema(),
@@ -385,7 +404,7 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
       "state": FieldSpec(self._representation.full_state_dim),
       "action": FieldSpec(self._num_actions),
       "prev_action": FieldSpec(self._num_actions),
-      "motion_time": FieldSpec(dtype=torch.long),
+      **self._task_buffer_schema(),
       "terminated": FieldSpec(dtype=torch.bool),
       "truncated": FieldSpec(dtype=torch.bool),
     }
@@ -395,6 +414,13 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
       )
     schema["sim_ctx"] = FieldSpec(self._sim_context.output_dim)
     return schema
+
+  def _task_buffer_schema(self) -> dict[str, FieldSpec]:
+    return {"motion_time": FieldSpec(dtype=torch.long)}
+
+  def _transition_task_fields(self) -> dict[str, torch.Tensor]:
+    motion_cmd = self.env.unwrapped.command_manager.get_term("motion")
+    return {"motion_time": motion_cmd.time_steps.clone()}
 
   def _init_policy(self) -> None:
     """Subclasses implement this to create their policy learner."""
@@ -411,9 +437,7 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
 
     When given, ``actor_td`` is queued for the actor-normalizer update.
     """
-    motion_cmd = self.env.unwrapped.command_manager.get_term("motion")
-    motion_times = motion_cmd.time_steps.clone()
-
+    task_fields = self._transition_task_fields()
     raw_actions = actions.detach().clone()
     prev_action = self.action_manager.action.clone()
 
@@ -429,7 +453,7 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
       "state": curr_states,
       "action": raw_actions,
       "prev_action": prev_action,
-      "motion_time": motion_times,
+      **task_fields,
       "terminated": terminated,
       "truncated": truncated,
     }
@@ -516,7 +540,114 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
     wandb.finish()
 
 
-class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
+class WorldModelRunner[CfgT: WorldModelRunnerCfg](BaseRunner[CfgT]):
+  """Alternates real-sim collection, dynamics fitting and imagined policy updates."""
+
+  policy_warmup_updates = 0
+  skip_empty_replay_windows = False
+
+  def _init_common(self) -> None:
+    super()._init_common()
+    self._num_wm_updates = 0
+
+  def step(self) -> int:
+    raise NotImplementedError
+
+  def _save_checkpoint(self, checkpoint_dir: Path) -> list[str]:
+    raise NotImplementedError
+
+  def _publish_checkpoint(self, files: list[str]) -> None:
+    log_model_artifact(files)
+
+  def run(self) -> None:
+    log_dir = self._create_log_dir()
+    self._init_wandb(log_dir)
+
+    self.env.reset()
+    self._seed_sim_history()
+    initial_files = self._save_checkpoint(log_dir / "checkpoint_0")
+    uploader = ThreadPoolExecutor(max_workers=1)
+    upload = uploader.submit(self._publish_checkpoint, initial_files)
+
+    print(f"[INFO] Starting training loop for {self.cfg.max_iterations} iterations...")
+
+    should_train = Ratio(
+      self.env.num_envs
+      / self.cfg.wm.num_batches
+      / self.cfg.wm.batch_size
+      / self.cfg.wm.horizon
+      * self.cfg.replay_ratio
+    )
+
+    num_collected_steps = 0
+    start_time = time.time()
+    wm_learn_time = 0.0
+    policy_learn_time = 0.0
+    loss_dict: dict[str, torch.Tensor] = {}
+    log_count = 0
+
+    for step in range(self.cfg.max_iterations):
+      num_collected_steps += self.step()
+
+      for _ in range(should_train(step)):
+        if self.replay_buffer.num_transitions < self.cfg.wm.horizon:
+          continue
+
+        data = (
+          self.replay_buffer.sample(self.cfg.wm.horizon, self.cfg.wm.batch_size)
+          for _ in range(self.cfg.wm.num_batches)
+        )
+
+        start_wm_time = time.time()
+        try:
+          wm_logs = self.world_model_learner.update(data)
+        except NoValidReplaySequenceError:
+          if not self.skip_empty_replay_windows:
+            raise
+          break
+        wm_learn_time += time.time() - start_wm_time
+        self._num_wm_updates += 1
+        loss_dict.update(wm_logs)
+
+        if self._num_wm_updates >= self.policy_warmup_updates:
+          start_policy_time = time.time()
+          policy_logs = self.policy_learner.update()
+          policy_learn_time += time.time() - start_policy_time
+          loss_dict.update(policy_logs)
+
+      if step % self.cfg.log_interval == 0:
+        elapsed_time = time.time() - start_time
+        total_train_time = wm_learn_time + policy_learn_time
+        collect_time = elapsed_time - total_train_time
+
+        self.logger.log(
+          it=log_count,
+          total_it=self.cfg.max_iterations // self.cfg.log_interval,
+          collect_time=collect_time,
+          wm_learn_time=wm_learn_time,
+          policy_learn_time=policy_learn_time,
+          loss_dict=loss_dict,
+          num_collected_steps=num_collected_steps,
+        )
+
+        log_count += 1
+        start_time = time.time()
+        wm_learn_time = 0
+        policy_learn_time = 0
+        num_collected_steps = 0
+
+      iteration = step + 1
+      if iteration % self.cfg.save_interval == 0:
+        checkpoint_files = self._save_checkpoint(log_dir / f"checkpoint_{iteration}")
+        # Keep at most one checkpoint upload pending.
+        upload.result()
+        upload = uploader.submit(self._publish_checkpoint, checkpoint_files)
+
+    uploader.shutdown()
+    self._cleanup()
+
+
+class SuperMimicRunner(WorldModelRunner[SuperMimicRunnerCfg]):
   """Trains WM + multi-encoder actor end-to-end via BPTT/AC.
 
   Slots are contiguous blocks of the env batch; each block routes through its
@@ -700,84 +831,3 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       str(checkpoint_dir / Path(path).relative_to(staging_dir))
       for path in checkpoint_files
     ]
-
-  def run(self) -> None:
-    log_dir = self._create_log_dir()
-    self._init_wandb(log_dir)
-
-    self.env.reset()
-    self._seed_sim_history()
-    initial_files = self._save_checkpoint(log_dir / "checkpoint_0")
-    uploader = ThreadPoolExecutor(max_workers=1)
-    upload = uploader.submit(log_model_artifact, initial_files)
-
-    print(f"[INFO] Starting training loop for {self.cfg.max_iterations} iterations...")
-
-    should_train = Ratio(
-      self.env.num_envs
-      / self.cfg.wm.num_batches
-      / self.cfg.wm.batch_size
-      / self.cfg.wm.horizon
-      * self.cfg.replay_ratio
-    )
-
-    num_collected_steps = 0
-    start_time = time.time()
-    wm_learn_time = 0.0
-    policy_learn_time = 0.0
-    loss_dict: dict[str, torch.Tensor] = {}
-    log_count = 0
-
-    for step in range(self.cfg.max_iterations):
-      num_collected_steps += self.step()
-
-      for _ in range(should_train(step)):
-        if self.replay_buffer.num_transitions < self.cfg.wm.horizon:
-          continue
-
-        data = (
-          self.replay_buffer.sample(self.cfg.wm.horizon, self.cfg.wm.batch_size)
-          for _ in range(self.cfg.wm.num_batches)
-        )
-
-        start_wm_time = time.time()
-        wm_logs = self.world_model_learner.update(data)
-        wm_learn_time += time.time() - start_wm_time
-
-        start_policy_time = time.time()
-        policy_logs = self.policy_learner.update()
-        policy_learn_time += time.time() - start_policy_time
-
-        loss_dict.update(wm_logs)
-        loss_dict.update(policy_logs)
-
-      if step % self.cfg.log_interval == 0:
-        elapsed_time = time.time() - start_time
-        total_train_time = wm_learn_time + policy_learn_time
-        collect_time = elapsed_time - total_train_time
-
-        self.logger.log(
-          it=log_count,
-          total_it=self.cfg.max_iterations // self.cfg.log_interval,
-          collect_time=collect_time,
-          wm_learn_time=wm_learn_time,
-          policy_learn_time=policy_learn_time,
-          loss_dict=loss_dict,
-          num_collected_steps=num_collected_steps,
-        )
-
-        log_count += 1
-        start_time = time.time()
-        wm_learn_time = 0
-        policy_learn_time = 0
-        num_collected_steps = 0
-
-      iteration = step + 1
-      if iteration % self.cfg.save_interval == 0:
-        checkpoint_files = self._save_checkpoint(log_dir / f"checkpoint_{iteration}")
-        # Keep at most one checkpoint upload pending.
-        upload.result()
-        upload = uploader.submit(log_model_artifact, checkpoint_files)
-
-    uploader.shutdown()
-    self._cleanup()

@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 from tensordict import TensorDict
 
-from supermimic.envs.world_model_env import WorldModelEnv
+from supermimic.envs.world_model_env import DifferentiableWorldModelEnv
 from supermimic.learners.learner_utils import (
   CapturedUpdate,
   _optimize_step,
@@ -63,7 +63,7 @@ class BpttPolicyLearner:
   def __init__(
     self,
     policy: nn.Module,
-    wm_env: WorldModelEnv,
+    wm_env: DifferentiableWorldModelEnv,
     cfg: BpttPolicyLearnerCfg,
     device: str = "cpu",
   ):
@@ -152,7 +152,7 @@ class ActorCriticPolicyLearner(BpttPolicyLearner):
     self,
     policy: nn.Module,
     critic: nn.Module,
-    wm_env: WorldModelEnv,
+    wm_env: DifferentiableWorldModelEnv,
     cfg: ActorCriticPolicyLearnerCfg,
     device: str = "cpu",
   ):
