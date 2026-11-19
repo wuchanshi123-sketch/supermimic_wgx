@@ -111,6 +111,20 @@ after that clip's last frame. Use `ls -l /dev/input/by-id/*-joystick` to locate
 the gamepad. For a nonstandard layout, `--gamepad-axes '(0, 1, 3)'` sets the raw
 axis indices for left X, left Y and right X.
 
+## Play G1 reference motions
+
+Open a reference `.npz` directly in MuJoCo using the recorded root pose, joint
+angles, and frame rate. No trained checkpoint is needed.
+
+```bash
+uv run src/supermimic/scripts/play_npz.py ../WalkandRun_amp_walk_50hz_speed_aug
+```
+
+Pass a single `.npz` to inspect one clip, or pass a directory or quoted glob to
+play files in filename order. Use `--speed 0.5` for slow motion or `--once` to
+stop after the last clip. **Space** pauses or resumes, **Left/Right** switches
+clips, and **Enter** restarts the current clip.
+
 ## Acknowledgements
 
 SuperMimic contains code inspired by these projects:
