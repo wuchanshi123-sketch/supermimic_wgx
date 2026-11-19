@@ -17,6 +17,7 @@ from supermimic.scripts.train_utils import (
   download_registry_motions,
   setup_device,
 )
+from supermimic.tasks.velocity_follow_env import configure_velocity_follow
 
 
 @dataclass
@@ -81,6 +82,17 @@ def main() -> None:
   args.env.commands["motion"].sampling_mode = (
     "external" if args.runner.sampling_mode == "return" else args.runner.sampling_mode
   )
+  if args.runner.tasks.velocity.mode == "follow":
+    motion_fraction = args.runner.slot_mix.get("motion", 0.0)
+    velocity_start = round(args.num_envs * motion_fraction)
+    if (
+      not 0 < velocity_start < args.num_envs
+      or args.runner.slot_mix.get("velocity", 0.0) <= 0
+    ):
+      raise ValueError(
+        "Velocity follow mode needs both motion and velocity environments"
+      )
+    configure_velocity_follow(args.env, velocity_start)
 
   env = create_env(args.env, args.num_envs, device)
 

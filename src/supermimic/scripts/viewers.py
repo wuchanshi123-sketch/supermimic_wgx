@@ -31,6 +31,8 @@ from supermimic.tasks.task_spec import (
   TaskSpec,
   build_actor_obs_td,
 )
+from supermimic.tasks.velocity_follow_env import VelocityFollowMotion
+from supermimic.utils.gamepad import Gamepad
 
 
 def create_wm_vis_model(base_model: mujoco.MjModel) -> mujoco.MjModel:
@@ -355,18 +357,47 @@ class SuperMimicNativeViewer(SuperMimicViewerMixin, NativeMujocoViewer):
     sim_context: SimContext,
     task_specs: list[TaskSpec],
     initial_task: str = "motion",
+    gamepad: Gamepad | None = None,
     **kwargs,
   ):
     super().__init__(env, actor, **kwargs)
+    self._gamepad = gamepad
     self.setup_supermimic(
       dynamics,
       representation,
       num_steps_rollout,
       sim_context,
       task_specs,
-      initial_task,
+      "velocity" if gamepad is not None else initial_task,
     )
     self.setup_wm_visualizer(wm_vis_model)
+    if gamepad is not None:
+      motion = env.unwrapped.command_manager.get_term("motion")
+      if not isinstance(motion, VelocityFollowMotion):
+        raise ValueError("Gamepad playback needs a velocity following environment")
+      self._gamepad_motion = motion
+      checkpoint_ranges = tuple(
+        (spec.min, spec.max)
+        for spec in self.task_specs["velocity"].goal_specs
+        if isinstance(spec, ContinuousGoalSpec)
+      )
+      if len(checkpoint_ranges) != 3:
+        raise ValueError("Gamepad playback needs three velocity command axes")
+      vx_range, _, wz_range = checkpoint_ranges
+      self._gamepad_ranges = (vx_range, (-1.0, 1.0), wz_range)
+
+  def step_and_predict(self, *, force: bool = False) -> bool:
+    if self._gamepad is not None and (force or not self._is_paused):
+      # Both the simulated and imagined policies read this same command for
+      # the step. Polling in either policy path could mix two joystick samples.
+      for i, (axis, (lo, hi)) in enumerate(
+        zip(self._gamepad.read(), self._gamepad_ranges, strict=True)
+      ):
+        limit = max(hi, 0.0) if axis >= 0 else max(-lo, 0.0)
+        target = axis * limit
+        self.set_raw_goal("velocity", i, min(hi, max(lo, target)) if target else 0.0)
+      self._gamepad_motion.velocity_goal = self._raw_goal_state["velocity"]
+    return super().step_and_predict(force=force)
 
   def setup(self) -> None:
     if sys.platform == "darwin":

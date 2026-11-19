@@ -1,20 +1,18 @@
 """Per-task specs for the multi-encoder actor.
 
-A ``TaskSpec`` bundles everything needed to route one task through the actor:
-the goal width and two pure functions that turn either a motion clip
-(training) or a user-supplied command (inference) into the ``goal_obs``
-tensor the encoder consumes. Reward is motion-tracking for every
-task and lives in the WM env, not here.
+A ``TaskSpec`` describes the goal input for one task encoder, with functions
+for deriving reference goals from motion and processing user commands.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from math import isfinite
+from typing import TYPE_CHECKING, Literal
 
 import torch
-from mjlab.utils.lab_api.math import quat_apply_inverse
+from mjlab.utils.lab_api.math import quat_apply_inverse, yaw_quat
 from tensordict import TensorDict
 
 from supermimic.representations import actor_goal_dim
@@ -103,22 +101,14 @@ def make_velocity_task(
   window_frames: int,
   command_noise: tuple[float, float, float],
   device: str = "cpu",
+  *,
+  mode: Literal["imitation", "follow"] = "imitation",
 ) -> TaskSpec:
-  """Velocity-command task: 3D body-frame ``[vx_b, vy_b, wz_b]``.
+  """Build the three-channel velocity goal and its reference replay table.
 
-  Matches mjlab's velocity-tracking command convention: linear x/y in the
-  root body frame, yaw rate about the body z-axis. At training time the
-  command is projected from the motion's root velocity into the body frame
-  and perturbed by fresh per-step uniform noise (``command_noise``,
-  per-axis half-width) clamped to the configured ranges; at inference time
-  the slider widgets supply it directly.
-
-  ``window_frames`` controls a centered mean over N motion frames around
-  ``t`` (``0`` or ``1`` = raw instantaneous). The reference motion is
-  known offline, so there is no causality constraint — centering avoids
-  the ~N/2 * dt lag a causal window would introduce. The window clamps to
-  the concatenated motion array (not per clip), so frames within ~N/2 of a
-  clip boundary average in a neighbouring clip's velocity.
+  Imitation mode projects the reference into the robot body frame and adds
+  uniform noise to the training command. Follow mode uses planar velocity in
+  the reference heading frame and world yaw rate, averaged within the clip.
   """
   lo = torch.tensor(
     [lin_vel_x_range[0], lin_vel_y_range[0], ang_vel_z_range[0]], device=device
@@ -131,7 +121,7 @@ def make_velocity_task(
   def _clamp(cmd):
     return torch.clamp(cmd, lo.to(cmd.device), hi.to(cmd.device))
 
-  def _centered_mean(track, motion_times):
+  def _centered_mean(track, motion_times, motion_ends=None):
     if window_frames <= 1:
       return track[motion_times]
     half = window_frames // 2
@@ -139,7 +129,14 @@ def make_velocity_task(
       torch.arange(window_frames, device=motion_times.device, dtype=motion_times.dtype)
       - half
     )
-    idx = (motion_times.unsqueeze(-1) + offsets).clamp(min=0, max=track.shape[0] - 1)
+    idx = motion_times.unsqueeze(-1) + offsets
+    if motion_ends is None:
+      idx = idx.clamp(min=0, max=track.shape[0] - 1)
+    else:
+      clip = torch.searchsorted(motion_ends, motion_times, right=True)
+      first = torch.cat([motion_ends.new_zeros(1), motion_ends[:-1]])[clip]
+      last = motion_ends[clip] - 1
+      idx = torch.clamp(idx, min=first.unsqueeze(-1), max=last.unsqueeze(-1))
     return track[idx].mean(dim=1)
 
   def _body_frame_cmd(motion, times, quat):
@@ -147,30 +144,50 @@ def make_velocity_task(
     w_b = quat_apply_inverse(quat, _centered_mean(motion.root_ang_vel_w, times))
     return torch.stack([v_b[:, 0], v_b[:, 1], w_b[:, 2]], dim=-1)
 
+  def _heading_frame_reference(motion, times):
+    mean_lin_vel = _centered_mean(motion.root_lin_vel_w, times, motion.motion_ends)
+    mean_yaw_rate = _centered_mean(
+      motion.root_ang_vel_w[:, 2], times, motion.motion_ends
+    )
+    lin_vel = quat_apply_inverse(yaw_quat(motion.root_quat_w[times]), mean_lin_vel)
+    return torch.cat([lin_vel[:, :2], mean_yaw_rate[:, None]], dim=-1)
+
   def extract(motion, motion_times, aux_state):
+    if mode == "follow":
+      return _heading_frame_reference(motion, motion_times)
     cmd = _body_frame_cmd(motion, motion_times, aux_state[:, 3:7])
     noise = (torch.rand_like(cmd) * 2 - 1) * noise_half.to(cmd.device)
     return _clamp(cmd + noise)
 
   def precompute_replay_goal(motion):
-    """Project each frame's centered-mean world velocity into the body frame
-    using the motion's reference root quat (on-manifold assumption); no noise
-    added, but cfg range clamping is preserved so the encoder sees the same
-    value distribution as training.
-    """
+    """Return the noise-free commands used for reference replay."""
     device = motion.root_lin_vel_w.device
-    times = torch.arange(motion.root_lin_vel_w.shape[0], device=device)
+    frame_count = motion.root_lin_vel_w.shape[0]
+    if mode == "follow":
+      # Limit the temporary [frames, window] indexing buffers for large libraries.
+      commands = torch.empty_like(motion.root_lin_vel_w)
+      for start in range(0, frame_count, 65_536):
+        stop = min(start + 65_536, frame_count)
+        times = torch.arange(start, stop, device=device)
+        commands[start:stop] = _heading_frame_reference(motion, times)
+      return commands
+    times = torch.arange(frame_count, device=device)
     cmd = _body_frame_cmd(motion, times, motion.root_quat_w)
     return _clamp(cmd)
+
+  def slider(name: str, bounds: tuple[float, float]) -> ContinuousGoalSpec:
+    lower, upper = bounds
+    default = min(upper, max(lower, 0.0)) if mode == "follow" else 0.0
+    return ContinuousGoalSpec(name, lower, upper, step=0.1, default=default)
 
   return TaskSpec(
     name="velocity",
     goal_dim=3,
     extract_training_goal=extract,
     goal_specs=(
-      ContinuousGoalSpec("Lin Vel X (m/s)", *lin_vel_x_range, step=0.1, default=0.0),
-      ContinuousGoalSpec("Lin Vel Y (m/s)", *lin_vel_y_range, step=0.1, default=0.0),
-      ContinuousGoalSpec("Ang Vel Z (rad/s)", *ang_vel_z_range, step=0.1, default=0.0),
+      slider("Lin Vel X (m/s)", lin_vel_x_range),
+      slider("Lin Vel Y (m/s)", lin_vel_y_range),
+      slider("Ang Vel Z (rad/s)", ang_vel_z_range),
     ),
     build_inference_goal_obs=lambda raw: raw,
     raw_goal_dim=3,
@@ -180,7 +197,7 @@ def make_velocity_task(
 
 @dataclass(frozen=True)
 class VelocityTaskCfg:
-  """Body-frame velocity-command task."""
+  """Velocity-command task with optional explicit speed following."""
 
   lin_vel_x_range: tuple[float, float] = (-1.5, 1.5)
   lin_vel_y_range: tuple[float, float] = (-0.5, 0.5)
@@ -189,7 +206,33 @@ class VelocityTaskCfg:
   """Centered-mean window over motion-velocity command. 0/1 = raw instantaneous."""
   command_noise: tuple[float, float, float] = (0.5, 0.5, 0.785)
   """Uniform noise half-width per axis (lin_x, lin_y, ang_z) added to the
-  velocity command each step, then clamped to the configured ranges."""
+  velocity command in imitation mode."""
+  mode: Literal["imitation", "follow"] = "imitation"
+  reference_probability: float = 0.5
+  """Probability of drawing a reference command source at each renewal."""
+  standing_probability: float = 0.1
+  """Probability of a zero command conditional on the independent source."""
+  hold_seconds: float = 5.0
+  """Time between renewals of the command source and independent command."""
+  command_bins: tuple[int, int, int] = (5, 5, 5)
+  """Number of equal-width sampling bins in vx, vy and yaw rate."""
+
+  def __post_init__(self) -> None:
+    if self.mode != "follow":
+      return
+    if not 0.0 <= self.reference_probability <= 1.0:
+      raise ValueError("reference_probability must lie in [0, 1]")
+    if not 0.0 <= self.standing_probability <= 1.0:
+      raise ValueError("standing_probability must lie in [0, 1]")
+    if not isfinite(self.hold_seconds) or self.hold_seconds <= 0.0:
+      raise ValueError("hold_seconds must be finite and positive")
+    if len(self.command_bins) != 3 or any(
+      not isinstance(n, int) or n <= 0 for n in self.command_bins
+    ):
+      raise ValueError("command_bins must contain three positive counts")
+    ranges = (self.lin_vel_x_range, self.lin_vel_y_range, self.ang_vel_z_range)
+    if any(not (isfinite(lo) and isfinite(hi) and lo <= hi) for lo, hi in ranges):
+      raise ValueError("velocity ranges must have finite ordered endpoints")
 
 
 @dataclass(frozen=True)
@@ -214,5 +257,6 @@ def resolve_task_specs(
       tasks.velocity.window_frames,
       tasks.velocity.command_noise,
       device,
+      mode=tasks.velocity.mode,
     ),
   ]

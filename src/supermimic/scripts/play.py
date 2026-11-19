@@ -5,6 +5,7 @@ from __future__ import annotations
 import glob
 import json
 import os
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -31,6 +32,8 @@ from supermimic.scripts.viewers import (
   SuperMimicViserViewer,
   create_wm_vis_model,
 )
+from supermimic.tasks.velocity_follow_env import configure_velocity_follow
+from supermimic.utils.gamepad import Gamepad, GamepadError
 from supermimic.utils.local_checkpoints import resolve_checkpoint_actor
 from supermimic.utils.wandb_artifacts import (
   download_artifact_cached,
@@ -53,6 +56,12 @@ class PlayConfig:
   device: str | None = None
   num_steps_rollout: int = 1000000
   viewer: Literal["auto", "native", "viser"] = "viser"
+  gamepad_device: Path | None = None
+  """Linux joystick device for native velocity control, such as /dev/input/js1."""
+  gamepad_deadzone: float = 0.1
+  """Fraction of stick travel around the center that produces a zero command."""
+  gamepad_axes: tuple[int, int, int] | None = None
+  """Optional raw joystick axis indices in left X, left Y, right X order."""
 
 
 def play(task_id: str, cfg: PlayConfig) -> None:
@@ -60,6 +69,15 @@ def play(task_id: str, cfg: PlayConfig) -> None:
     raise ValueError("Pass exactly one of --checkpoint and --wandb-path.")
   if cfg.runner_config is not None and cfg.checkpoint is None:
     raise ValueError("--runner-config requires --checkpoint.")
+  if cfg.viewer == "auto":
+    has_display = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+    resolved = "native" if has_display else "viser"
+  else:
+    resolved = cfg.viewer
+  if cfg.gamepad_device is not None and resolved != "native":
+    raise ValueError("Gamepad playback requires --viewer native.")
+  if cfg.gamepad_axes is not None and cfg.gamepad_device is None:
+    raise ValueError("--gamepad-axes requires --gamepad-device.")
 
   actor_path = cfg.checkpoint.expanduser() if cfg.checkpoint is not None else None
   run = None
@@ -88,6 +106,8 @@ def play(task_id: str, cfg: PlayConfig) -> None:
     runner_cfg = load_runner_cfg(run.config)
 
   check_representation_matches(task_id, runner_cfg.representation)
+  if cfg.gamepad_device is not None and runner_cfg.slot_mix.get("velocity", 0.0) <= 0:
+    raise ValueError("Gamepad playback needs a checkpoint trained with velocity slots.")
   configure_torch_backends()
   device = cfg.device or ("cuda:0" if torch.cuda.is_available() else "cpu")
 
@@ -123,62 +143,59 @@ def play(task_id: str, cfg: PlayConfig) -> None:
       motion_names = [a.name.split(":")[0] for a in motion_artifacts]
       print(f"[INFO] Loaded {len(motion_files)} motion(s)")
 
-  env = RslRlVecEnvWrapper(ManagerBasedRlEnv(cfg=env_cfg, device=device))
+  if cfg.gamepad_device is not None:
+    # The reference clip supplies a reset pose. Keep its cursor inside the clip
+    # and apply the velocity task's fall criteria during continuous control.
+    reset_interval = 2 * env_cfg.episode_length_s
+    command_term.resampling_time_range = (reset_interval, reset_interval)
+    configure_velocity_follow(env_cfg, velocity_start=0)
 
-  wm = build_world_model(runner_cfg, env, device)
-  dynamics = wm.dynamics
+  with ExitStack() as resources:
+    gamepad = None
+    if cfg.gamepad_device is not None:
+      device_path = cfg.gamepad_device.expanduser()
+      gamepad = resources.enter_context(
+        Gamepad(device_path, cfg.gamepad_deadzone, axes=cfg.gamepad_axes)
+      )
+      print(f"[INFO] Gamepad {device_path}: left stick walk/strafe, right stick turn")
+    env = RslRlVecEnvWrapper(ManagerBasedRlEnv(cfg=env_cfg, device=device))
+    resources.callback(env.close)
 
-  if actor_path is None:
-    assert run is not None
-    actor_path = download_model_dir(run) / "actor.pt"
-  wm.load_bundle(
-    torch.load(actor_path.with_name("world_model.pt"), map_location=device)
-  )
-  dynamics.eval()
+    wm = build_world_model(runner_cfg, env, device)
+    dynamics = wm.dynamics
+    if actor_path is None:
+      assert run is not None
+      actor_path = download_model_dir(run) / "actor.pt"
+    wm.load_bundle(
+      torch.load(actor_path.with_name("world_model.pt"), map_location=device)
+    )
+    dynamics.eval()
 
-  actor = build_actor(runner_cfg, wm, device)
-  actor.load_state_dict(torch.load(actor_path, map_location=device))
-  actor.eval()
+    actor = build_actor(runner_cfg, wm, device)
+    actor.load_state_dict(torch.load(actor_path, map_location=device))
+    actor.eval()
+    if gamepad is not None and actor.goal_normalizers["velocity"].count.item() == 0:
+      raise ValueError(
+        "The checkpoint's velocity encoder has not seen any training samples."
+      )
 
-  wm_vis_model = create_wm_vis_model(env.unwrapped.sim.mj_model)
-
-  if cfg.viewer == "auto":
-    has_display = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
-    resolved = "native" if has_display else "viser"
-  else:
-    resolved = cfg.viewer
-  print(f"[INFO] Starting viewer: {resolved}")
-
-  if resolved == "native":
-    viewer = SuperMimicNativeViewer(
+    print(f"[INFO] Starting viewer: {resolved}")
+    viewer_args = dict(
       env=env,
       actor=actor,
       dynamics=dynamics,
       representation=wm.representation,
-      wm_vis_model=wm_vis_model,
+      wm_vis_model=create_wm_vis_model(env.unwrapped.sim.mj_model),
       num_steps_rollout=cfg.num_steps_rollout,
       sim_context=wm.sim_context,
       task_specs=actor.task_specs,
       initial_task=cfg.initial_task,
     )
-  else:
-    viewer = SuperMimicViserViewer(
-      env=env,
-      actor=actor,
-      dynamics=dynamics,
-      representation=wm.representation,
-      wm_vis_model=wm_vis_model,
-      num_steps_rollout=cfg.num_steps_rollout,
-      motion_names=motion_names,
-      sim_context=wm.sim_context,
-      task_specs=actor.task_specs,
-      initial_task=cfg.initial_task,
-    )
-
-  try:
+    if resolved == "native":
+      viewer = SuperMimicNativeViewer(**viewer_args, gamepad=gamepad)
+    else:
+      viewer = SuperMimicViserViewer(**viewer_args, motion_names=motion_names)
     viewer.run()
-  finally:
-    env.close()
 
 
 def main() -> None:
@@ -192,7 +209,7 @@ def main() -> None:
   args = tyro.cli(PlayConfig, args=remaining_args, config=mjlab.TYRO_FLAGS)
   try:
     play(chosen_task, args)
-  except NativeViewerStartupTimeout as exc:
+  except (NativeViewerStartupTimeout, GamepadError) as exc:
     raise SystemExit(str(exc)) from None
 
 

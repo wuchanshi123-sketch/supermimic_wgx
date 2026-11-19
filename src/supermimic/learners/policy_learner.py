@@ -15,6 +15,7 @@ from supermimic.learners.learner_utils import (
   build_optimizers,
   graph_state,
 )
+from supermimic.models import TaskCritics
 
 
 @dataclass
@@ -160,12 +161,24 @@ class ActorCriticPolicyLearner(BpttPolicyLearner):
     self.critic = critic
     self.critic_optimizers = build_optimizers([critic], self.cfg.lr, device=device)
     self._v_max = self.wm_env.max_step_reward / (1 - self.cfg.gamma)
+    self._velocity_v_max: float | None = None
+    if isinstance(critic, TaskCritics):
+      velocity_max_step_reward = getattr(wm_env, "velocity_max_step_reward", None)
+      if velocity_max_step_reward is None:
+        raise ValueError("TaskCritics requires a velocity reward ceiling")
+      self._velocity_v_max = velocity_max_step_reward / (1 - self.cfg.gamma)
+
+  def _value_limit(self, obs: torch.Tensor) -> float | torch.Tensor:
+    if self._velocity_v_max is None:
+      return self._v_max
+    return torch.where(TaskCritics.is_velocity(obs), self._velocity_v_max, self._v_max)
 
   def _bootstrap(
     self, obs: TensorDict, survival: torch.Tensor, term_prob: torch.Tensor
   ) -> torch.Tensor:
     self.critic.requires_grad_(False)
-    value = self.critic(obs["critic"]).clamp(max=self._v_max).squeeze(-1)
+    critic_obs = obs["critic"]
+    value = self.critic(critic_obs).clamp(max=self._value_limit(critic_obs)).squeeze(-1)
     alive = survival if self.cfg.survival_masking else 1.0 - term_prob
     return self.cfg.gamma**self.cfg.horizon * value * alive
 
@@ -183,7 +196,7 @@ class ActorCriticPolicyLearner(BpttPolicyLearner):
       steps["done"].unsqueeze(-1),
       self.cfg.gamma,
       self.cfg.lam,
-    ).clamp(max=self._v_max)
+    ).clamp(max=self._value_limit(steps["critic"]))
     obs, returns = steps["critic"].flatten(0, 1), returns.flatten(0, 1)
     perm = torch.randperm(len(returns) // 4 * 4, device=returns.device)
     self.critic.requires_grad_(True)

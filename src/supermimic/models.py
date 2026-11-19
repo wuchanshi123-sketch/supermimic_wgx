@@ -116,6 +116,8 @@ class MultiEncoderAE(nn.Module):
                                        decoder input
     ``obs_td[f"goal_{task.name}"]``  — full-batch goal per task; only the
                                        task's slot range is read
+    ``obs_td["velocity_reference"]``  — reference-command mask for velocity BC
+                                       in velocity-follow training
   """
 
   def __init__(
@@ -128,6 +130,7 @@ class MultiEncoderAE(nn.Module):
     hidden_dims: tuple[int, ...],
     latent_bc_weight: float,
     history_length: int,
+    velocity_follow: bool = False,
   ):
     super().__init__()
     if not task_specs:
@@ -136,6 +139,7 @@ class MultiEncoderAE(nn.Module):
     self.history_length = history_length
     self.latent_dim = latent_dim
     self.latent_bc_weight = latent_bc_weight
+    self.velocity_follow = velocity_follow
     self.task_specs = task_specs
     self._task_names = [ts.name for ts in task_specs]
     # Anchor: the first task. The aux-loss hook regularizes each non-anchor
@@ -198,7 +202,28 @@ class MultiEncoderAE(nn.Module):
 
     z = torch.cat([torch.tanh(eo) for eo in enc_outs], dim=0)
     history_n = self.obs_normalizer(obs_td["history"])
-    return self.decoder(torch.cat([z, history_n.flatten(start_dim=1)], dim=-1))
+    decoder_input = torch.cat([z, history_n.flatten(start_dim=1)], dim=-1)
+    if not self.velocity_follow or "velocity" not in self._task_names:
+      return self.decoder(decoder_input)
+    if not torch.is_grad_enabled():
+      return self.decoder(decoder_input)
+
+    velocity_lo, velocity_hi = slots[self._task_names.index("velocity")]
+    if velocity_lo == velocity_hi:
+      return self.decoder(decoder_input)
+    # Detach only the parameters. Velocity rewards must still backpropagate
+    # through the decoder output to the velocity encoder and the rollout state.
+    detached = {name: param.detach() for name, param in self.decoder.named_parameters()}
+    velocity_actions = torch.func.functional_call(
+      self.decoder, detached, (decoder_input[velocity_lo:velocity_hi],)
+    )
+    actions = []
+    if velocity_lo:
+      actions.append(self.decoder(decoder_input[:velocity_lo]))
+    actions.append(velocity_actions)
+    if velocity_hi < decoder_input.shape[0]:
+      actions.append(self.decoder(decoder_input[velocity_hi:]))
+    return torch.cat(actions, dim=0)
 
   def _compute_aux_loss(
     self, obs_td: TensorDict, slots: list[tuple[int, int]]
@@ -225,7 +250,10 @@ class MultiEncoderAE(nn.Module):
       z = torch.tanh(self.encoders[name](goal_n_d))
       with torch.no_grad():
         z_anchor = torch.tanh(self.encoders[anchor](anchor_goal_d[lo:hi]))
-      out[lo:hi] = self.latent_bc_weight * ((z - z_anchor) ** 2).mean(dim=-1)
+      loss = self.latent_bc_weight * ((z - z_anchor) ** 2).mean(dim=-1)
+      if self.velocity_follow and name == "velocity":
+        loss = loss * obs_td["velocity_reference"][lo:hi]
+      out[lo:hi] = loss
     return out
 
   def auxiliary_loss(self) -> torch.Tensor:
@@ -246,3 +274,42 @@ class MultiEncoderAE(nn.Module):
       if lo == hi:
         continue
       self.goal_normalizers[name].update(obs_td[f"goal_{name}"][lo:hi])
+
+
+class TaskCritics(nn.Module):
+  """Route mixed or shuffled rows to separate motion and velocity critics.
+
+  Input layout is ``[rep_state, motion_goal, sim_ctx, command, is_velocity]``.
+  Motion receives the original layout, while velocity sees its own command
+  instead of the full reference motion. Both critics return one value per row.
+  """
+
+  def __init__(
+    self,
+    motion_critic: nn.Module,
+    velocity_critic: nn.Module,
+    rep_state_dim: int,
+    motion_goal_dim: int,
+  ) -> None:
+    super().__init__()
+    self.motion_critic = motion_critic
+    self.velocity_critic = velocity_critic
+    self._rep_state_dim = rep_state_dim
+    self._sim_ctx_start = rep_state_dim + motion_goal_dim
+
+  @staticmethod
+  def is_velocity(obs: torch.Tensor) -> torch.Tensor:
+    return obs[..., -1:].bool()
+
+  def forward(self, obs: torch.Tensor) -> torch.Tensor:
+    motion_value = self.motion_critic(obs[..., :-4])
+    velocity_obs = torch.cat(
+      [
+        obs[..., : self._rep_state_dim],
+        obs[..., -4:-1],
+        obs[..., self._sim_ctx_start : -4],
+      ],
+      dim=-1,
+    )
+    velocity_value = self.velocity_critic(velocity_obs)
+    return torch.where(self.is_velocity(obs), velocity_value, motion_value)

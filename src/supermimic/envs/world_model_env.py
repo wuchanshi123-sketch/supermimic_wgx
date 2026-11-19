@@ -11,7 +11,7 @@ pattern inspired by mjlab's ManagerBasedRlEnv:
 holds state only after ``reset()``. Subclasses implement only
 ``get_observations``, whose actor keys are the one thing that differs between a
 single-actor policy and the multi-encoder actor, and may override
-``_build_task_goals`` to emit extra per-task goal tensors.
+``_build_task_goals`` and ``_score_transition`` for task-specific goals and rewards.
 """
 
 from __future__ import annotations
@@ -57,7 +57,9 @@ class WorldModelEnv(ABC):
 
     # Analytic per-step reward ceiling: positive tracking-reward weights, dt-scaled.
     self.max_step_reward = env.unwrapped.step_dt * sum(
-      term.weight for term in env.cfg.rewards.values() if term.weight > 0.0
+      term.weight
+      for name, term in env.cfg.rewards.items()
+      if name != "velocity_follow" and term.weight > 0.0
     )
 
     # Reference-motion buffers.
@@ -180,9 +182,26 @@ class WorldModelEnv(ABC):
       rep_state, action, aux_state, sim_ctx
     )
     next_joint_state = self.representation.joint_state(next_rep_state)
-    ref_body_pos_w, ref_body_quat_w, ref_body_lin_vel_w, ref_body_ang_vel_w = (
-      self._ref_body_state
+    term_prob, reward = self._score_transition(
+      next_rep_state,
+      next_aux_state,
+      next_joint_state,
+      action,
+      last_action,
+      self._ref_body_state,
     )
+    return next_aux_state, next_rep_state, next_joint_state, term_prob, reward
+
+  def _score_transition(
+    self,
+    next_rep_state: torch.Tensor,
+    next_aux_state: torch.Tensor,
+    next_joint_state: torch.Tensor,
+    action: torch.Tensor,
+    last_action: torch.Tensor,
+    reference: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+  ) -> tuple[torch.Tensor, torch.Tensor]:
+    ref_body_pos_w, ref_body_quat_w, ref_body_lin_vel_w, ref_body_ang_vel_w = reference
     term_prob = self._compute_term_prob(next_aux_state, ref_body_pos_w, ref_body_quat_w)
     reward = self.representation.compute_wm_reward_from_reference(
       next_rep_state,
@@ -195,7 +214,7 @@ class WorldModelEnv(ABC):
       ref_body_lin_vel_w,
       ref_body_ang_vel_w,
     )
-    return next_aux_state, next_rep_state, next_joint_state, term_prob, reward
+    return term_prob, reward
 
   def _compute_term_prob(
     self,
@@ -258,10 +277,16 @@ class WorldModelEnv(ABC):
     ``sensor_window`` holds the H sensor frames ending at the init state, and
     ``pad_mask`` flags its clamp-padded slots.
     """
+    return self._sample_initial_batch(self.num_envs)
+
+  def _sample_initial_batch(
+    self, batch_size: int, env_range: tuple[int, int] | None = None
+  ) -> TensorDict:
+    sampling = {} if env_range is None else {"env_range": env_range}
     if self.history_length == 1:
-      return self.replay_buffer.sample(1, self.num_envs).squeeze(1)
+      return self.replay_buffer.sample(1, batch_size, **sampling).squeeze(1)
     window, padded = self.replay_buffer.sample_causal(
-      self.history_length, self.num_envs
+      self.history_length, batch_size, **sampling
     )
     batch = window[:, -1]
     batch["sensor_window"] = window["actor_obs"]

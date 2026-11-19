@@ -52,7 +52,11 @@ class ReplayBuffer:
     self.num_transitions = min(self.buffer_size, self.num_transitions + 1)
 
   def sample_causal(
-    self, sequence_length: int, batch_size: int
+    self,
+    sequence_length: int,
+    batch_size: int,
+    *,
+    env_range: tuple[int, int] | None = None,
   ) -> tuple[TensorDict, torch.Tensor]:
     """Sample a window of ``L`` frames ENDING at a uniformly-drawn filled frame.
 
@@ -67,14 +71,15 @@ class ReplayBuffer:
     mask that is ``True`` on the clamp-padded slots, so the caller can noise the
     oldest real frame once and share that realization across them.
     """
-    L, B, E, T = sequence_length, batch_size, self.num_envs, self.buffer_size
+    L, B, T = sequence_length, batch_size, self.buffer_size
+    lo, hi = self._env_bounds(env_range)
     dev, n = self.device, self.num_transitions
     if L > T:
       raise ValueError(f"sequence_length {L} exceeds buffer_size {T}")
     if n < 1:
       raise RuntimeError("sample_causal on empty buffer")
     base = self._step if n == T else 0
-    env_idx = torch.randint(E, (B,), device=dev)
+    env_idx = torch.randint(lo, hi, (B,), device=dev)
     current_age = torch.randint(n, (B,), device=dev)
     ages = current_age[:, None] + (
       torch.arange(L, device=dev) - (L - 1)
@@ -93,8 +98,23 @@ class ReplayBuffer:
     slot = (base + torch.where(reachable, ages, first_age)) % T
     return self._storage[env_idx[:, None], slot], ~reachable
 
-  def sample(self, sequence_length: int, batch_size: int) -> TensorDict:
-    L, B, E, T = sequence_length, batch_size, self.num_envs, self.buffer_size
+  def _env_bounds(self, env_range: tuple[int, int] | None) -> tuple[int, int]:
+    lo, hi = env_range if env_range is not None else (0, self.num_envs)
+    if not 0 <= lo < hi <= self.num_envs:
+      raise ValueError(f"Invalid replay environment range {(lo, hi)}")
+    return lo, hi
+
+  def sample(
+    self,
+    sequence_length: int,
+    batch_size: int,
+    *,
+    env_range: tuple[int, int] | None = None,
+  ) -> TensorDict:
+    """Sample done-free windows within the optional half-open environment range."""
+    L, B, T = sequence_length, batch_size, self.buffer_size
+    lo, hi = self._env_bounds(env_range)
+    E = hi - lo
     dev, n = self.device, self.num_transitions
     if L > T:
       raise ValueError(f"sequence_length {L} exceeds buffer_size {T}")
@@ -102,7 +122,7 @@ class ReplayBuffer:
     # In age-space windows are linear, so wrap and warm-up collapse into one predicate.
     base = self._step if n == T else 0
     ages = torch.arange(T, device=dev)
-    ended = (self._storage["terminated"] | self._storage["truncated"])[
+    ended = (self._storage["terminated"][lo:hi] | self._storage["truncated"][lo:hi])[
       :, (base + ages) % T
     ].long()
     # Interior [a, a+L-2] is done-free iff c[a+L-1] == c[a] (c is cumsum with leading 0).
@@ -118,4 +138,4 @@ class ReplayBuffer:
     u = (torch.rand(B, device=dev) * total[env_idx].float()).long()
     age_start = torch.searchsorted(csum[env_idx], u[:, None], right=True).squeeze(-1)
     storage_idx = (base + age_start[:, None] + torch.arange(L, device=dev)) % T
-    return self._storage[env_idx[:, None], storage_idx]
+    return self._storage[lo + env_idx[:, None], storage_idx]

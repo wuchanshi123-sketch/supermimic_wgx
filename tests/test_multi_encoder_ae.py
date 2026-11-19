@@ -19,7 +19,9 @@ from tests.conftest import (
 BATCH = 16
 
 
-def _make_actor(slot_mix=None, history_length: int = 1) -> MultiEncoderAE:
+def _make_actor(
+  slot_mix=None, history_length: int = 1, velocity_follow: bool = False
+) -> MultiEncoderAE:
   return MultiEncoderAE(
     obs_dim=OBS_DIM,
     action_dim=ACTION_DIM,
@@ -29,6 +31,7 @@ def _make_actor(slot_mix=None, history_length: int = 1) -> MultiEncoderAE:
     hidden_dims=(32, 32),
     latent_bc_weight=1.0,
     history_length=history_length,
+    velocity_follow=velocity_follow,
   )
 
 
@@ -152,6 +155,42 @@ class TestGradientFlow:
       assert not p.grad.isnan().any()
     for name, p in actor.decoder.named_parameters():
       assert p.grad is not None, f"decoder.{name} got no grad"
+
+  def test_velocity_follow_reward_freezes_decoder_weights_only_for_velocity(self):
+    actor = _make_actor(velocity_follow=True)
+    obs = make_actor_obs(BATCH)
+    obs["history"].requires_grad_()
+    obs["velocity_reference"] = torch.zeros(BATCH, dtype=torch.bool)
+    velocity = slice(BATCH // 2, None)
+
+    actor(obs)[velocity].square().sum().backward()
+    assert any(
+      p.grad is not None and torch.count_nonzero(p.grad)
+      for p in actor.encoders["velocity"].parameters()
+    )
+    assert torch.count_nonzero(obs["history"].grad[velocity])
+    assert all(
+      p.grad is None or not torch.count_nonzero(p.grad)
+      for p in actor.decoder.parameters()
+    )
+
+    actor.zero_grad()
+    actor(obs)[: BATCH // 2].square().sum().backward()
+    assert any(
+      p.grad is not None and torch.count_nonzero(p.grad)
+      for p in actor.decoder.parameters()
+    )
+
+  def test_velocity_follow_aligns_only_reference_commands(self):
+    actor = _make_actor(velocity_follow=True)
+    obs = make_actor_obs(BATCH)
+    obs["velocity_reference"] = torch.arange(BATCH) % 2 == 0
+    actor(obs)
+
+    loss = actor.auxiliary_loss()
+    assert torch.count_nonzero(loss[: BATCH // 2]) == 0
+    assert torch.count_nonzero(loss[~obs["velocity_reference"]]) == 0
+    assert (loss[BATCH // 2 :: 2] > 0).all()
 
 
 class TestSlotRanges:

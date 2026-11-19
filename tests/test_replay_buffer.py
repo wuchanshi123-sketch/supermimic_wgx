@@ -38,6 +38,21 @@ def test_insert_increments_counter():
   assert buf.num_transitions == 5
 
 
+def test_task_environment_ranges_apply_to_both_replay_samplers():
+  buf = ReplayBuffer(_schema(), buffer_size=5, num_envs=4)
+  for step in range(4):
+    td = _step_td(4, float(step))
+    td["state"][:, 1] = torch.arange(4)
+    buf.insert(td)
+
+  for limits in ((0, 2), (2, 4)):
+    rollout = buf.sample(3, 16, env_range=limits)
+    history, _ = buf.sample_causal(3, 16, env_range=limits)
+    for batch in (rollout, history):
+      source = batch["state"][..., 1]
+      assert ((source >= limits[0]) & (source < limits[1])).all()
+
+
 def test_insert_caps_at_buffer_size():
   buf = ReplayBuffer(_schema(), buffer_size=10, num_envs=4)
   for i in range(25):

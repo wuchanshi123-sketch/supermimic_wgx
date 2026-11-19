@@ -13,6 +13,7 @@ from typing import Annotated, Literal
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import tyro
 import wandb
 from rsl_rl.models import MLPModel
@@ -27,7 +28,7 @@ from supermimic.learners.policy_learner import (
   BpttPolicyLearnerCfg,
 )
 from supermimic.learners.wm_learner import WorldModelLearner, WorldModelLearnerCfg
-from supermimic.models import Dynamics, MultiEncoderAE, build_mlp
+from supermimic.models import Dynamics, MultiEncoderAE, TaskCritics, build_mlp
 from supermimic.replay_buffer import FieldSpec, ReplayBuffer
 from supermimic.representations import StateRepresentation, create_representation
 from supermimic.runners.exporter import export_actor_as_onnx
@@ -38,6 +39,8 @@ from supermimic.tasks.task_spec import (
   build_actor_obs_td,
   resolve_task_specs,
 )
+from supermimic.tasks.velocity_commands import VelocityCommands, reference_bc_mask
+from supermimic.tasks.velocity_follow_env import VelocityFollowMotion
 from supermimic.utils.helpers import (
   extract_action_scale_offset,
   unpack_obs_dims,
@@ -200,6 +203,7 @@ def build_actor(
     hidden_dims=cfg.actor_hidden_dims,
     latent_bc_weight=cfg.latent_bc_weight,
     history_length=cfg.history_length,
+    velocity_follow=cfg.tasks.velocity.mode == "follow",
   ).to(device)
 
 
@@ -519,10 +523,18 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
 class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
   """Trains WM + multi-encoder actor end-to-end via BPTT/AC.
 
-  Slots are contiguous blocks of the env batch; each block routes through its
-  task's encoder. Motion-tracking reward is the only reward path; tasks differ
-  only in what goal modality their encoder consumes.
+  Slots are contiguous blocks of the env batch routed through their task's encoder.
   """
+
+  def _buffer_schema(self) -> dict[str, FieldSpec]:
+    schema = super()._buffer_schema()
+    if self.cfg.tasks.velocity.mode == "follow":
+      schema.update(
+        velocity_command=FieldSpec(3),
+        velocity_reference=FieldSpec(dtype=torch.bool),
+        velocity_steps=FieldSpec(dtype=torch.long),
+      )
+    return schema
 
   def _init_policy(self) -> None:
     actor = build_actor(self.cfg, self._wm, self.device)
@@ -530,10 +542,9 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       ts for ts in actor.task_specs if self.cfg.slot_mix.get(ts.name, 0.0) > 0.0
     ]
 
+    sim_slots = actor.slot_ranges(self.env.num_envs)
     print("[INFO] Sim slot ranges:")
-    for ts, (lo, hi) in zip(
-      actor.task_specs, actor.slot_ranges(self.env.num_envs), strict=True
-    ):
+    for ts, (lo, hi) in zip(actor.task_specs, sim_slots, strict=True):
       print(f"  {ts.name}: [{lo}, {hi}) — goal_dim={ts.goal_dim}")
     _, critic_input_dim = self._policy_input_dims()
     critic = build_mlp(
@@ -543,6 +554,52 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
     ).to(self.device)
 
     policy_cfg = self.cfg.policy
+    self._sim_velocity: VelocityCommands | None = None
+    self._sim_velocity_start = self.env.num_envs
+    velocity_cfg = None
+    wm_velocity_start = None
+    if self.cfg.tasks.velocity.mode == "follow":
+      velocity_cfg = self.cfg.tasks.velocity
+      self._sim_velocity_start = sim_slots[0][1]
+      wm_velocity_start = actor.slot_ranges(policy_cfg.batch_size)[0][1]
+      n_velocity = self.env.num_envs - self._sim_velocity_start
+      if not (
+        0 < self._sim_velocity_start < self.env.num_envs
+        and 0 < wm_velocity_start < policy_cfg.batch_size
+      ):
+        raise ValueError(
+          "Velocity following needs both tasks in the simulator and world-model batches"
+        )
+      if (
+        not isinstance(self.motion_cmd, VelocityFollowMotion)
+        or self.motion_cmd.velocity_start != self._sim_velocity_start
+      ):
+        raise ValueError(
+          "Configure the MuJoCo velocity follow slots before constructing the runner"
+        )
+      velocity_task = next(
+        ts for ts in self._active_task_specs if ts.name == "velocity"
+      )
+      assert velocity_task.precompute_replay_goal is not None
+      self._sim_velocity = VelocityCommands(
+        velocity_cfg,
+        velocity_task.precompute_replay_goal(self.motion),
+        n_velocity,
+        self.env.unwrapped.step_dt,
+        self.device,
+      )
+      self._sim_velocity_state = self._sim_velocity.sample()
+      self._velocity_log_sum = torch.zeros(5, device=self.device)
+      self._velocity_log_steps = 0
+      if isinstance(policy_cfg, ActorCriticPolicyLearnerCfg):
+        velocity_critic = build_mlp(
+          critic_input_dim - self._num_goals + 3,
+          self.cfg.critic_hidden_dims,
+          output_dim=1,
+        ).to(self.device)
+        critic = TaskCritics(
+          critic, velocity_critic, self._representation.rep_state_dim, self._num_goals
+        )
 
     self.wm_env = MultiTaskWorldModelEnv(
       dynamics=self._dynamics,
@@ -554,6 +611,9 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       history_length=self.cfg.history_length,
       termination_softness=self.cfg.termination_softness,
       device=self.device,
+      velocity_cfg=velocity_cfg,
+      velocity_start=wm_velocity_start,
+      sim_velocity_start=self._sim_velocity_start if velocity_cfg is not None else None,
     )
     if torch.cuda.is_available():
       self.wm_env.step = torch.compile(self.wm_env.step)
@@ -589,8 +649,21 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
     goals = {
       ts.name: ts.extract_training_goal(self.motion, motion_times, aux_state)
       for ts in self._active_task_specs
+      if ts.name != "velocity" or self._sim_velocity is None
     }
-    return build_actor_obs_td(goals, self._collection_history(sensor))
+    if self._sim_velocity is None:
+      return build_actor_obs_td(goals, self._collection_history(sensor))
+
+    fixed, sources, _ = self._sim_velocity_state
+    start = self._sim_velocity_start
+    command = self._sim_velocity.goal(fixed, sources, motion_times[start:])
+    assert isinstance(self.motion_cmd, VelocityFollowMotion)
+    self.motion_cmd.velocity_goal = command
+    goals["velocity"] = F.pad(command, (0, 0, start, 0))
+    obs = build_actor_obs_td(goals, self._collection_history(sensor))
+    bc_mask = reference_bc_mask(sources, motion_times[start:], self.motion.motion_ends)
+    obs["velocity_reference"] = F.pad(bc_mask, (start, 0))
+    return obs
 
   def _configure_reset_sampling(self) -> None:
     self._sampler: ReturnSampler | None = None
@@ -611,7 +684,7 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       cfg=self.cfg.return_sampler,
       bin_count=self.motion_cmd.bin_count,
       frame_count=self.motion.time_step_total,
-      num_envs=self.env.num_envs,
+      num_envs=self._sim_velocity_start,
       max_step_reward=self.wm_env.max_step_reward,
       device=self.device,
     )
@@ -637,6 +710,14 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       extra_fields = {"sim_ctx": sim_ctx}
       if self._stores_actor_obs:
         extra_fields["actor_obs"] = sim_actor_obs
+      if self._sim_velocity is not None:
+        fixed, sources, remaining = self._sim_velocity_state
+        start = self._sim_velocity_start
+        extra_fields.update(
+          velocity_command=F.pad(fixed, (0, 0, start, 0)),
+          velocity_reference=F.pad(sources, (start, 0)),
+          velocity_steps=F.pad(remaining, (start, 0)),
+        )
 
       next_obs, rewards, dones, extras = self._step_and_store(
         actions,
@@ -644,6 +725,20 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
         actor_td=actor_td,
         extra_fields=extra_fields,
       )
+      if self._sim_velocity is not None:
+        assert isinstance(self.motion_cmd, VelocityFollowMotion)
+        error = (
+          self.motion_cmd.velocity_measured - self.motion_cmd.velocity_goal
+        ).abs()
+        self._velocity_log_sum[:3] += error.mean(dim=0)
+        self._velocity_log_sum[3] += sources.float().mean()
+        self._velocity_log_sum[4] += (
+          actor_td["velocity_reference"][start:].float().mean()
+        )
+        self._velocity_log_steps += 1
+        self._sim_velocity_state = self._sim_velocity.advance(
+          fixed, sources, remaining, reset=dones[start:]
+        )
       self._advance_sim_history(next_obs["actor"].to(self.device), dones)
       terminated = self.env.unwrapped.termination_manager.terminated
       self.logger.process_env_step(rewards, terminated, extras)
@@ -653,12 +748,13 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
         manager = self.env.unwrapped.termination_manager
         truncated = manager.time_outs.to(self.device, torch.bool)
         clip_end = manager.get_term("motion_end").to(self.device, torch.bool)
+        slots = slice(None, self._sim_velocity_start)
         weights = self._sampler.record(
-          motion_times,
-          rewards,
-          terminated.to(self.device, torch.bool) & ~truncated,
-          clip_end,
-          truncated & ~clip_end,
+          motion_times[slots],
+          rewards[slots],
+          terminated[slots].to(self.device, torch.bool) & ~truncated[slots],
+          clip_end[slots],
+          truncated[slots] & ~clip_end[slots],
         )
         if weights is not None:
           self.motion_cmd.set_sampling_distribution(weights)
@@ -755,6 +851,23 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
         elapsed_time = time.time() - start_time
         total_train_time = wm_learn_time + policy_learn_time
         collect_time = elapsed_time - total_train_time
+        if self._sim_velocity is not None:
+          stats = self._velocity_log_sum / self._velocity_log_steps
+          loss_dict.update(
+            zip(
+              (
+                "Velocity/vx_mae",
+                "Velocity/vy_mae",
+                "Velocity/wz_mae",
+                "Velocity/reference_fraction",
+                "Velocity/reference_bc_fraction",
+              ),
+              stats.unbind(),
+              strict=True,
+            )
+          )
+          self._velocity_log_sum.zero_()
+          self._velocity_log_steps = 0
 
         self.logger.log(
           it=log_count,
