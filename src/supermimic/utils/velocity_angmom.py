@@ -16,6 +16,9 @@ if TYPE_CHECKING:
   from mjlab.envs import ManagerBasedRlEnv
 
 
+type BodyKinematics = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+
+
 @dataclass(frozen=True)
 class _BodyLevel:
   parents: tuple[int, ...]
@@ -23,7 +26,7 @@ class _BodyLevel:
   constants: torch.Tensor
 
 
-def _select_columns(x: torch.Tensor, columns: tuple[int, ...]) -> torch.Tensor:
+def select_columns(x: torch.Tensor, columns: tuple[int, ...]) -> torch.Tensor:
   """Pack static columns without differentiating through an index gather."""
   return torch.stack([x[..., i, :] for i in columns], dim=-2)
 
@@ -36,6 +39,7 @@ class VelocityAngularMomentum:
     model = env.sim.mj_model
     device = env.device
     body_ids = robot.indexing.body_ids.cpu().tolist()
+    names_by_id = dict(zip(body_ids, robot.body_names, strict=True))
     root, *remaining = body_ids
     cols = {
       address: column
@@ -86,6 +90,7 @@ class VelocityAngularMomentum:
       parents = current
       remaining = [b for b in remaining if b not in current]
     self._levels = tuple(levels)
+    self.body_names = tuple(names_by_id[body] for body in bodies)
 
     com_event = env.cfg.events.get("base_com")
     com_body = (
@@ -120,19 +125,23 @@ class VelocityAngularMomentum:
     by the CoM randomization event. Root rotation and uniform translation leave
     angular-momentum magnitude about the subtree CoM invariant.
     """
+    return self.from_kinematics(self.body_kinematics(rep_state), com_ipos)
+
+  def body_kinematics(self, rep_state: torch.Tensor) -> BodyKinematics:
+    """Return link poses and twists in pelvis axes, with base translation removed."""
     _, _, _, root_omega, joint_pos, joint_vel = decompose_rep_state(rep_state)
     joints = torch.cat((joint_pos.unsqueeze(-1), joint_vel.unsqueeze(-1)), dim=-1)
     joints = torch.nn.functional.pad(joints, (0, 0, 0, 1))
     pos = torch.zeros_like(root_omega).unsqueeze(-2)
-    quat = rep_state.new_tensor([1.0, 0.0, 0.0, 0.0]).expand(*pos.shape[:-1], 4)
+    quat = torch.cat((torch.ones_like(pos[..., :1]), pos), dim=-1)
     vel = pos
     omega = root_omega.unsqueeze(-2)
     positions, quats, velocities, angular_velocities = [pos], [quat], [vel], [omega]
     for level in self._levels:
       parent_pos, parent_quat, parent_vel, parent_omega = (
-        _select_columns(x, level.parents) for x in (pos, quat, vel, omega)
+        select_columns(x, level.parents) for x in (pos, quat, vel, omega)
       )
-      q, dq = _select_columns(joints, level.joints).split(1, dim=-1)
+      q, dq = select_columns(joints, level.joints).split(1, dim=-1)
       offset, anchor, axis, fixed_q, turn_q, qpos0 = level.constants.split(
         (3, 3, 3, 4, 4, 1), dim=-1
       )
@@ -155,6 +164,13 @@ class VelocityAngularMomentum:
     pos, quat, vel, omega = (
       torch.cat(xs, dim=-2) for xs in (positions, quats, velocities, angular_velocities)
     )
+    return pos, quat, vel, omega
+
+  def from_kinematics(
+    self, kin: BodyKinematics, com_ipos: torch.Tensor | None = None
+  ) -> torch.Tensor:
+    """Return squared subtree angular momentum from precomputed link kinematics."""
+    pos, quat, vel, omega = kin
     body_ipos = self._ipos
     if com_ipos is not None:
       body_ipos = body_ipos + self._com_mask * (com_ipos - self._default_com).unsqueeze(

@@ -112,6 +112,55 @@ and `world_model.pt`. The new run uses the saved actor during replay warm-up
 and trains a fresh critic with the current rewards. `--runner.max-iterations`
 counts iterations in the new run, which starts saving at `checkpoint_0`.
 
+### G1 velocity following with AMP
+
+`SuperMimic-GenCoord-G1-Velocity-AMP` adds a learned gait-style reward to the
+velocity task. Following `supermimic_vibe`, the discriminator looks at two
+adjacent frames of 13 G1 links. Each frame contains link poses relative to the
+torso and linear and angular velocities in the links' local frames. The
+discriminator learns from real MuJoCo replay and reference clips. The actor
+receives the style reward during differentiable world-model rollouts alongside
+the existing velocity reward.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 uv run src/supermimic/scripts/train.py \
+  SuperMimic-GenCoord-G1-Velocity-AMP --num-envs 2048 \
+  --runner.amp.motion-file ../WalkandRun_amp_walk_50hz \
+  --runner.run-name supermimic_g1_velocity_amp --runner.max-iterations 100000 \
+  --env.sim.mujoco.iterations 50 --env.sim.mujoco.ls-iterations 50
+```
+
+The AMP task defaults to the sibling `WalkandRun_amp_walk_50hz` directory.
+`--runner.amp.motion-file` also accepts a single `.npz` or a quoted glob. The
+file frame rate must match the controller rate. Clips are sampled equally,
+then an adjacent pair is sampled within each selected clip. The discriminator
+updates running normalization from both reference and replay frames and uses
+two least-squares batches per world-model update, with a gradient penalty on
+reference samples.
+
+`--runner.amp.weight` defaults to `1.25`, which gives a maximum style bonus
+of `0.025` per step at 50 Hz. The reward follows Vibe's curve above a
+discriminator score of `-0.5` and uses a smooth exponential tail below that
+point so that poorly scored policy transitions can still receive a style
+gradient. The bonus ramps up from zero with the command magnitude and is
+reduced by linear and yaw tracking errors.
+`AMP/style_reward` reports the mean unweighted style score on real replay,
+before command and tracking factors. `AMP/expert_score`, `AMP/policy_score`
+and `AMP/gradient_penalty` describe discriminator training.
+
+`world_model.pt` stores the discriminator and normalization statistics.
+`--runner.init-checkpoint` restores the actor and dynamics. It restores AMP
+weights from checkpoints using the same feature and objective version. Older
+AMP checkpoints initialize a fresh discriminator for the link features.
+AMP warm starts cap the actor learning rate at `1e-5` and penalize deviations
+from the saved actor's actions on the same imagined observations. The critic
+uses its normal learning rate. The cap and action penalty can be adjusted with
+`--runner.amp.warm-start-actor-lr` and `--runner.amp.action-anchor-weight`.
+Local playback uses the trained actor, plus the world model for the
+prediction ghost.
+
+### G1 velocity playback
+
 Drive a local velocity actor with a Linux gamepad in the native MuJoCo window.
 
 ```bash

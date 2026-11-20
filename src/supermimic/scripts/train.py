@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from pathlib import Path
 
 import mjlab.tasks  # noqa: F401
 import tyro
@@ -13,6 +14,7 @@ from mjlab.tasks.registry import list_tasks, load_env_cfg
 import supermimic.tasks  # noqa: F401
 from supermimic.runners.supermimic_runner import SuperMimicRunner, SuperMimicRunnerCfg
 from supermimic.runners.velocity_runner import (
+  VELOCITY_AMP_TASK_ID,
   VELOCITY_TASK_ID,
   VelocityRunner,
   VelocityRunnerCfg,
@@ -47,15 +49,15 @@ class TrainConfig:
 
 def main() -> None:
   # Parse first argument to choose the task.
-  all_tasks = sorted([*list_tasks(), VELOCITY_TASK_ID])
+  all_tasks = sorted([*list_tasks(), VELOCITY_TASK_ID, VELOCITY_AMP_TASK_ID])
   chosen_task, remaining_args = tyro.cli(
     tyro.extras.literal_type_from_choices(all_tasks),
     add_help=False,
     return_unknown_args=True,
     config=mjlab.TYRO_FLAGS,
   )
-  if chosen_task == VELOCITY_TASK_ID:
-    train_velocity(remaining_args)
+  if chosen_task in (VELOCITY_TASK_ID, VELOCITY_AMP_TASK_ID):
+    train_velocity(remaining_args, chosen_task)
     return
   args = tyro.cli(
     TrainConfig,
@@ -113,12 +115,20 @@ class VelocityTrainConfig:
   device: str | None = None
 
 
-def train_velocity(remaining_args: list[str]) -> None:
-  args = tyro.cli(VelocityTrainConfig, args=remaining_args, config=mjlab.TYRO_FLAGS)
+def train_velocity(remaining_args: list[str], task_id: str = VELOCITY_TASK_ID) -> None:
+  default = VelocityTrainConfig()
+  if task_id == VELOCITY_AMP_TASK_ID:
+    default.runner.amp = replace(
+      default.runner.amp,
+      motion_file=str(Path(__file__).resolve().parents[4] / "WalkandRun_amp_walk_50hz"),
+    )
+  args = tyro.cli(
+    VelocityTrainConfig, args=remaining_args, default=default, config=mjlab.TYRO_FLAGS
+  )
   device = setup_device(args.device)
-  print(f"[INFO] Loading environment: {VELOCITY_TASK_ID}")
+  print(f"[INFO] Loading environment: {task_id}")
   env = create_env(args.env, args.num_envs, device)
-  VelocityRunner(env, args.runner, task_id=VELOCITY_TASK_ID, device=device).run()
+  VelocityRunner(env, args.runner, task_id=task_id, device=device).run()
 
 
 if __name__ == "__main__":

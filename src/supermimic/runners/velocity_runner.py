@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import cast
@@ -14,11 +15,15 @@ from tensordict import TensorDict
 from torch import nn
 
 from supermimic.envs.velocity_world_model_env import VelocityWorldModelEnv
+from supermimic.learners.amp_style import AmpDiscriminator, AmpStyleCfg, AmpStyleLearner
 from supermimic.learners.policy_learner import (
   ActorCriticPolicyLearner,
   ActorCriticPolicyLearnerCfg,
 )
-from supermimic.learners.velocity_wm_learner import VelocityWorldModelLearner
+from supermimic.learners.velocity_wm_learner import (
+  VelocityAmpTraining,
+  VelocityWorldModelLearner,
+)
 from supermimic.models import _CudaGraphNormalization, build_mlp
 from supermimic.replay_buffer import FieldSpec
 from supermimic.representations import GenCoordRepresentation, StateRepresentation
@@ -29,13 +34,18 @@ from supermimic.runners.supermimic_runner import (
   build_world_model,
 )
 from supermimic.tasks.velocity_env_cfg import SimVelocityReward, VelocityCommand
+from supermimic.utils.amp_body_features import AmpBodyFeatures
+from supermimic.utils.amp_reference import AmpReference
 from supermimic.utils.local_checkpoints import resolve_checkpoint_actor
+from supermimic.utils.velocity_angmom import VelocityAngularMomentum
 from supermimic.utils.velocity_collision import (
   VELOCITY_REWARD_SIGNAL_COUNT,
   VelocityRewardSignalModel,
 )
 
 VELOCITY_TASK_ID = "SuperMimic-GenCoord-G1-Velocity"
+VELOCITY_AMP_TASK_ID = "SuperMimic-GenCoord-G1-Velocity-AMP"
+AMP_DISCRIMINATOR_VERSION = 3
 
 
 @dataclass
@@ -53,6 +63,7 @@ class VelocityRunnerCfg(WorldModelRunnerCfg):
   action_limit: float = 3.0
   init_checkpoint: str | None = None
   """Local checkpoint directory supplying actor.pt and world_model.pt for a new run."""
+  amp: AmpStyleCfg = field(default_factory=AmpStyleCfg)
 
   def __post_init__(self) -> None:
     if self.representation != "gencoord" or self.actor_obs != "proprio":
@@ -104,6 +115,7 @@ class VelocityRunner(WorldModelRunner[VelocityRunnerCfg]):
 
   def _build_world_model(self) -> WorldModel:
     self._init_actor_path = self._initial_actor_path()
+    bundle = None
     # Bind the robot's limits without the motion clip's kinematics provider.
     wm = build_world_model(
       self.cfg, self.env, self.device, bind_representation=StateRepresentation.bind
@@ -128,7 +140,46 @@ class VelocityRunner(WorldModelRunner[VelocityRunnerCfg]):
         raise ValueError(
           f"World model from {model_path} does not match the current runner"
         ) from exc
+    self._amp = self._initialize_amp(wm, bundle)
     return wm
+
+  def _initialize_amp(
+    self, wm: WorldModel, bundle: dict | None
+  ) -> VelocityAmpTraining | None:
+    cfg = self.cfg.amp
+    if cfg.motion_file is None or cfg.weight == 0:
+      return None
+    joint_names = self.env.unwrapped.scene["robot"].joint_names
+    reference = AmpReference.load(
+      cfg.motion_file, joint_names, self.env.unwrapped.step_dt, self.device
+    )
+    features = AmpBodyFeatures(VelocityAngularMomentum(self.env.unwrapped))
+    discriminator = AmpDiscriminator(features.feature_dim, cfg).to(self.device)
+    with torch.no_grad():
+      expert_features = torch.cat(
+        [
+          features(wm.representation.represent(frames))
+          for frames in reference.states.split(4096)
+        ]
+      )
+      discriminator.fit_normalizer(expert_features)
+    if bundle is not None and "amp_discriminator" in bundle:
+      if bundle.get("amp_discriminator_version") == AMP_DISCRIMINATOR_VERSION:
+        discriminator.load_state_dict(bundle["amp_discriminator"])
+      else:
+        print(
+          "[INFO] Reinitializing the legacy AMP discriminator with torso-relative body features"
+        )
+    print(
+      f"[INFO] AMP loaded {reference.num_clips} reference clips "
+      f"({reference.num_transitions} transitions), reward weight {cfg.weight:g}"
+    )
+    return VelocityAmpTraining(
+      AmpStyleLearner(discriminator, cfg, self.device),
+      reference,
+      features,
+      expert_features,
+    )
 
   def _make_world_model_learner(self) -> VelocityWorldModelLearner:
     return VelocityWorldModelLearner(
@@ -137,6 +188,7 @@ class VelocityRunner(WorldModelRunner[VelocityRunnerCfg]):
       self.cfg.wm,
       self.device,
       self._reward_signals,
+      amp=self._amp,
     )
 
   def _initial_actor_path(self) -> Path | None:
@@ -224,16 +276,39 @@ class VelocityRunner(WorldModelRunner[VelocityRunnerCfg]):
       device=self.device,
       sim_context=self._sim_context,
       reward_signals=self._reward_signals,
+      amp_discriminator=self._amp.learner.discriminator
+      if self._amp is not None
+      else None,
+      amp_cfg=self.cfg.amp if self._amp is not None else None,
+      amp_features=self._amp.features if self._amp is not None else None,
     )
     if torch.device(self.device).type == "cuda":
       self.wm_env.reset = torch.compile(self.wm_env.reset)
       self.wm_env.step = torch.compile(self.wm_env.step)
+    actor_lr = None
+    action_regularizer = None
+    if self._amp is not None and self._init_actor_path is not None:
+      actor_lr = min(self.cfg.policy.lr, self.cfg.amp.warm_start_actor_lr)
+      if self.cfg.amp.action_anchor_weight > 0.0:
+        reference_actor = deepcopy(actor).eval().requires_grad_(False)
+        reward_dt = representation.dt if self.env.cfg.scale_rewards_by_dt else 1.0
+        anchor_scale = self.cfg.amp.action_anchor_weight * reward_dt
+
+        def action_anchor(obs: TensorDict, actions: torch.Tensor) -> torch.Tensor:
+          with torch.no_grad():
+            reference_actions = reference_actor(obs)
+          return anchor_scale * (actions - reference_actions).square().sum(dim=-1)
+
+        action_regularizer = action_anchor
+      print(f"[INFO] AMP warm-start actor learning rate: {actor_lr:g}")
     self.policy_learner = ActorCriticPolicyLearner(
       actor,
       critic,
       self.wm_env,
       self.cfg.policy,
       device=self.device,
+      actor_lr=actor_lr,
+      action_regularizer=action_regularizer,
     )
     self._action_noise = torch.zeros(
       self.env.num_envs, self._num_actions, device=self.device
@@ -287,6 +362,9 @@ class VelocityRunner(WorldModelRunner[VelocityRunnerCfg]):
     with self._stage_checkpoint(checkpoint_dir) as staging_dir:
       bundle = self._wm.bundle()
       bundle["velocity_reward_model"] = self._reward_signals.state_dict()
+      if self._amp is not None:
+        bundle["amp_discriminator"] = self._amp.learner.discriminator.state_dict()
+        bundle["amp_discriminator_version"] = AMP_DISCRIMINATOR_VERSION
       torch.save(bundle, staging_dir / "world_model.pt")
       torch.save(self.policy_learner.actor.state_dict(), staging_dir / "actor.pt")
       torch.save(self.policy_learner.critic.state_dict(), staging_dir / "critic.pt")

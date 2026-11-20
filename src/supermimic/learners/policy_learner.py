@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
@@ -68,13 +69,20 @@ class BpttPolicyLearner:
     device: str = "cpu",
     *,
     capture_updates: bool = True,
+    actor_lr: float | None = None,
+    action_regularizer: Callable[[TensorDict, torch.Tensor], torch.Tensor]
+    | None = None,
   ):
     self.actor = policy
     self.wm_env = wm_env
     self.cfg = cfg
+    self._action_regularizer = action_regularizer
     self.actor_params = list(self.actor.parameters())
     self.actor_optimizers = build_optimizers(
-      [self.actor], self.cfg.lr, betas=(0.9, self.cfg.beta2), device=device
+      [self.actor],
+      self.cfg.lr if actor_lr is None else actor_lr,
+      betas=(0.9, self.cfg.beta2),
+      device=device,
     )
     self._rollout_actor = (
       torch.compile(self.actor) if torch.device(device).type == "cuda" else self.actor
@@ -107,25 +115,38 @@ class BpttPolicyLearner:
     cfg = self.cfg
     obs = self.wm_env.reset(start)
     ret, aux_loss, survival = 0.0, 0.0, 1.0
+    action_penalty = 0.0
     rollout: list[TensorDict] = []
     for t in range(cfg.horizon):
       actions = self._rollout_actor(obs)
       next_obs, reward, term_prob, _ = self.wm_env.step(actions)
       step = {"critic": obs["critic"], "reward": reward, "done": term_prob}
       rollout.append(TensorDict(step, batch_size=reward.shape).detach())
-      ret = ret + cfg.gamma**t * survival * reward
+      discount = cfg.gamma**t * survival
+      ret = ret + discount * reward
       aux_loss = aux_loss + getattr(self.actor, "auxiliary_loss", lambda: 0.0)()
+      if self._action_regularizer is not None:
+        action_penalty = action_penalty + discount * self._action_regularizer(
+          obs, actions
+        )
       if cfg.survival_masking:
         survival = survival * (1 - term_prob)
       obs = next_obs
     ret = ret + self._bootstrap(obs, survival, term_prob)
-    loss = (-ret + aux_loss).mean()
+    loss = -ret + aux_loss
+    regularizer_stats = {}
+    if self._action_regularizer is not None:
+      loss = loss + action_penalty
+      regularizer_stats["action_regularizer"] = (
+        action_penalty.mean().detach() / cfg.horizon
+      )
     grad_norm = _optimize_step(
-      self.actor_optimizers, loss, self.actor_params, 1.0, cfg.grad_clip_value
+      self.actor_optimizers, loss.mean(), self.actor_params, 1.0, cfg.grad_clip_value
     )
     return {
       "return": ret.mean().detach(),
       "grad_norm": grad_norm,
+      **regularizer_stats,
       **self._fit_critic(rollout, obs),
       **getattr(self.actor, "auxiliary_stats", lambda: {})(),
     }
@@ -163,8 +184,19 @@ class ActorCriticPolicyLearner(BpttPolicyLearner):
     device: str = "cpu",
     *,
     capture_updates: bool = True,
+    actor_lr: float | None = None,
+    action_regularizer: Callable[[TensorDict, torch.Tensor], torch.Tensor]
+    | None = None,
   ):
-    super().__init__(policy, wm_env, cfg, device, capture_updates=capture_updates)
+    super().__init__(
+      policy,
+      wm_env,
+      cfg,
+      device,
+      capture_updates=capture_updates,
+      actor_lr=actor_lr,
+      action_regularizer=action_regularizer,
+    )
     self.critic = critic
     self.critic_optimizers = build_optimizers([critic], self.cfg.lr, device=device)
     self._v_max = self.wm_env.max_step_reward / (1 - self.cfg.gamma)

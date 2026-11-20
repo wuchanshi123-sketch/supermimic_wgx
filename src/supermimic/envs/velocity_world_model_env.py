@@ -9,16 +9,20 @@ import torch
 from tensordict import TensorDict
 
 from supermimic.envs.world_model_env import DifferentiableWorldModelEnv
+from supermimic.learners.amp_style import amp_command_gate
 from supermimic.tasks.velocity_env_cfg import advance_velocity_commands
+from supermimic.utils.gencoord_helpers import decompose_rep_state
 from supermimic.utils.velocity_angmom import VelocityAngularMomentum
 from supermimic.utils.velocity_reward import velocity_fall_error
 from supermimic.utils.velocity_torso import VelocityTorsoKinematics
 
 if TYPE_CHECKING:
+  from supermimic.learners.amp_style import AmpDiscriminator, AmpStyleCfg
   from supermimic.models import Dynamics
   from supermimic.replay_buffer import ReplayBuffer
   from supermimic.representations import GenCoordRepresentation
   from supermimic.sim_context import SimContext
+  from supermimic.utils.amp_body_features import AmpBodyFeatures
   from supermimic.utils.velocity_collision import VelocityRewardSignalModel
 
 
@@ -38,6 +42,9 @@ class VelocityWorldModelEnv(DifferentiableWorldModelEnv):
     *,
     sim_context: SimContext,
     reward_signals: VelocityRewardSignalModel,
+    amp_discriminator: AmpDiscriminator | None = None,
+    amp_cfg: AmpStyleCfg | None = None,
+    amp_features: AmpBodyFeatures | None = None,
   ) -> None:
     super().__init__(
       dynamics=dynamics,
@@ -54,7 +61,11 @@ class VelocityWorldModelEnv(DifferentiableWorldModelEnv):
     self._reward_cfg = reward_term.params["cfg"]
     self._evaluate_reward = reward_term.func.evaluate
     self._torso = VelocityTorsoKinematics(env.unwrapped)
-    self._angular_momentum = VelocityAngularMomentum(env.unwrapped)
+    self._angular_momentum = (
+      VelocityAngularMomentum(env.unwrapped)
+      if amp_features is None
+      else amp_features.kinematics
+    )
     self._sim_context = sim_context
     self._com_slice = sim_context.find("base_com")
     self._reward_signals = reward_signals
@@ -62,15 +73,30 @@ class VelocityWorldModelEnv(DifferentiableWorldModelEnv):
       raise ValueError("The velocity reward term weight must be finite and nonnegative")
     reward_dt = representation.dt if env.cfg.scale_rewards_by_dt else 1.0
     self._step_reward_scale = reward_term.weight * reward_dt
+    amp_enabled = amp_features is not None
+    if amp_enabled != (amp_discriminator is not None) or amp_enabled != (
+      amp_cfg is not None
+    ):
+      raise ValueError("AMP reward requires a discriminator, features and a config")
+    self._amp_discriminator = amp_discriminator
+    self._amp_features = amp_features
+    self._amp_step_scale = amp_cfg.weight * reward_dt if amp_cfg is not None else 0.0
+    self._style_command_gate = (
+      amp_cfg.style_command_gate if amp_cfg is not None else 0.0
+    )
     self._fall_cfg = env.cfg.terminations["fall"].params["cfg"]
     self._joint_limits = env.unwrapped.scene["robot"].data.soft_joint_pos_limits[0]
-    self.max_step_reward = self._reward_cfg.max_reward * self._step_reward_scale
+    self.max_step_reward = (
+      self._reward_cfg.max_reward * self._step_reward_scale + self._amp_step_scale
+    )
 
   def _on_reset(self, batch: TensorDict) -> None:
     # The newest replay row contains the command that produced its action.
     self.velocity_command = batch["velocity_command"]
     self.command_time_left = batch["command_time_left"]
     self._reset_sensor_history(batch)
+    if self._amp_features is not None:
+      self._amp_previous_features = self._amp_features(self.rep_state)
 
   def _compute_commands(self) -> None:
     self.velocity_command, self.command_time_left = advance_velocity_commands(
@@ -111,7 +137,15 @@ class VelocityWorldModelEnv(DifferentiableWorldModelEnv):
       if self._com_slice is not None
       else None
     )
-    angular_momentum_l2 = self._angular_momentum(next_rep_state, com_ipos)
+    if self._amp_features is None:
+      angular_momentum_l2 = self._angular_momentum(next_rep_state, com_ipos)
+    else:
+      kin = self._angular_momentum.body_kinematics(next_rep_state)
+      angular_momentum_l2 = self._angular_momentum.from_kinematics(kin, com_ipos)
+      next_features = self._amp_features(next_rep_state, kin)
+      assert self._amp_discriminator is not None
+      style = self._amp_discriminator.reward(self._amp_previous_features, next_features)
+      self._amp_previous_features = next_features
     joint_acc_l2, collision_count, foot_slip, soft_landing = self._reward_signals(
       rep_state, action, sim_ctx
     ).unbind(-1)
@@ -134,4 +168,16 @@ class VelocityWorldModelEnv(DifferentiableWorldModelEnv):
       soft_landing=soft_landing,
       terminated=term_prob,
     )
+    if self._amp_features is not None:
+      gate = amp_command_gate(self.velocity_command, self._style_command_gate)
+      # Style bonuses should be earned at the commanded speed. Use the same
+      # error widths as the task and score the post-transition velocity.
+      _, _, lin_vel, ang_vel, _, _ = decompose_rep_state(next_rep_state)
+      xy_error = (lin_vel[..., :2] - self.velocity_command[..., :2]).square().sum(-1)
+      yaw_error = (ang_vel[..., 2] - self.velocity_command[..., 2]).square()
+      tracking = torch.exp(
+        -xy_error / self._reward_cfg.linear_std**2
+        - yaw_error / self._reward_cfg.yaw_std**2
+      )
+      reward = reward + self._amp_step_scale * gate * style * tracking
     return next_aux_state, next_rep_state, next_joint_state, term_prob, reward

@@ -69,6 +69,13 @@ class _ConstantCritic(nn.Module):
     return obs * 0.0 + self.value
 
 
+class _ActiveTwoStepEnv(_TwoStepEnv):
+  def _obs(self) -> TensorDict:
+    obs = super()._obs()
+    obs["actor"].fill_(1.0)
+    return obs
+
+
 def test_survival_masking_counts_current_transition_reward_before_done():
   learner = BpttPolicyLearner(
     _DummyActor(),
@@ -109,3 +116,37 @@ def test_gae_returns_discount_by_soft_done():
   )
 
   assert torch.allclose(returns, torch.tensor([[1.495], [1.0]]))
+
+
+def test_action_regularizer_is_discounted_by_reward_and_survival():
+  actor = _DummyActor()
+
+  def action_regularizer(obs: TensorDict, actions: torch.Tensor) -> torch.Tensor:
+    return (actions + obs["actor"]).square().sum(-1)
+
+  learner = BpttPolicyLearner(
+    actor,
+    _ActiveTwoStepEnv(),
+    BpttPolicyLearnerCfg(horizon=2, gamma=0.8, survival_masking=True),
+    action_regularizer=action_regularizer,
+  )
+
+  stats = learner.update()
+
+  assert stats["Policy/action_regularizer"].item() == pytest.approx(
+    (1.0 + 0.8 * 0.5) / 2
+  )
+  # The positive action penalty increases twice as quickly as the reward at zero.
+  assert actor.weight.item() < 0.0
+
+
+def test_actor_learning_rate_override_keeps_critic_learning_rate():
+  cfg = ActorCriticPolicyLearnerCfg(lr=2e-4)
+  learner = ActorCriticPolicyLearner(
+    _DummyActor(), _ConstantCritic(1.0), _TwoStepEnv(), cfg, actor_lr=2e-5
+  )
+
+  assert float(learner.actor_optimizers[0].param_groups[0]["lr"]) == pytest.approx(2e-5)
+  assert float(learner.critic_optimizers[0].param_groups[0]["lr"]) == pytest.approx(
+    cfg.lr
+  )
