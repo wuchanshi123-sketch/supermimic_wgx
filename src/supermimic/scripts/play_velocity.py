@@ -7,11 +7,13 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+import mujoco
 import numpy as np
 import torch
 from mjlab.envs import ManagerBasedRlEnv
 from mjlab.rl import RslRlVecEnvWrapper
 from mjlab.viewer.debug_visualizer import DebugVisualizer
+from mujoco.viewer import Handle
 from tensordict import TensorDict
 
 from supermimic.representations import StateRepresentation
@@ -265,13 +267,55 @@ class GamepadVelocityPolicy:
         self.ghost.reset()
 
 
-def play_velocity(cfg: VelocityPlayConfig) -> None:
+class GamepadVelocityViewer(ManagedNativeMujocoViewer):
+  """Show the scaled gamepad command alongside the normal playback status."""
+
+  def __init__(
+    self,
+    env: RslRlVecEnvWrapper,
+    policy: GamepadVelocityPolicy,
+    command: VelocityCommand,
+  ) -> None:
+    super().__init__(env, policy, enable_perturbations=False)
+    self._velocity_command = command
+
+  def _set_status_overlay(self, viewer: Handle) -> None:
+    status = self.get_status()
+    capped = " [CAPPED]" if status.capped else ""
+    vx, vy, wz = self._velocity_command.command[self.env_idx].tolist()
+    font = mujoco.mjtFontScale.mjFONTSCALE_150.value
+    if not viewer.is_running():
+      return
+    viewer.set_texts(
+      [
+        (
+          font,
+          mujoco.mjtGridPos.mjGRID_TOPLEFT.value,
+          "Env\nStep\nStatus\nSpeed\nTarget RT\nActual RT",
+          f"{self.env_idx + 1}/{self.env.num_envs}\n"
+          f"{status.step_count}\n"
+          f"{'PAUSED' if status.paused else 'RUNNING'}{capped}\n"
+          f"{status.speed_label}\n"
+          f"{status.target_realtime:.2f}x\n"
+          f"{status.actual_realtime:.2f}x ({status.smoothed_fps:.0f} FPS)",
+        ),
+        (
+          font,
+          mujoco.mjtGridPos.mjGRID_TOPRIGHT.value,
+          "Gamepad command\nvx (m/s)\nvy (m/s)\nwz (rad/s)",
+          f" \n{vx:+.2f}\n{vy:+.2f}\n{wz:+.2f}",
+        ),
+      ]
+    )
+
+
+def play_velocity(cfg: VelocityPlayConfig, *, amp: bool = False) -> None:
   if cfg.num_steps_rollout < 1:
     raise ValueError("--num-steps-rollout must be positive")
   actor_path = resolve_checkpoint_actor(cfg.checkpoint.expanduser())
   wm_path = actor_path.with_name("world_model.pt")
   device = setup_device(cfg.device)
-  env_cfg = velocity_env_cfg(play=True)
+  env_cfg = velocity_env_cfg(play=True, amp=amp)
   env_cfg.sim.mujoco.iterations = 50
   env_cfg.sim.mujoco.ls_iterations = 50
 
@@ -311,6 +355,6 @@ def play_velocity(cfg: VelocityPlayConfig) -> None:
       print(
         f"[INFO] Gamepad: {gamepad.device} | Space: pause | Enter: reset", flush=True
       )
-      ManagedNativeMujocoViewer(env, policy, enable_perturbations=False).run()
+      GamepadVelocityViewer(env, policy, command).run()
     finally:
       env.close()

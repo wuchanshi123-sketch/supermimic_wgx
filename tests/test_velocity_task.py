@@ -149,11 +149,12 @@ def test_train_routes_velocity_separately_from_motion_tasks(
 
 
 @pytest.mark.parametrize(("history_length", "scale_by_dt"), [(1, True), (3, False)])
+@pytest.mark.parametrize("amp", [False, True])
 def test_imagined_step_uses_pre_switch_command_and_matches_simulator_reward(
-  monkeypatch, history_length, scale_by_dt
+  monkeypatch, history_length, scale_by_dt, amp
 ):
   representation = _representation()
-  cfg = velocity_env_cfg()
+  cfg = velocity_env_cfg(amp=amp)
   cfg.scale_rewards_by_dt = scale_by_dt
   cfg.rewards["velocity"].weight = 1.25
   cfg.commands["twist"] = replace(
@@ -276,7 +277,8 @@ def test_imagined_step_uses_pre_switch_command_and_matches_simulator_reward(
     joint_acc=joint_acc,
     soft_joint_pos_limits=limits,
   )
-  scene["robot/root_angmom"] = SimpleNamespace(data=lin_vel_b)
+  if not amp:
+    scene["robot/root_angmom"] = SimpleNamespace(data=lin_vel_b)
   torch.testing.assert_close(lin_vel_w[:2, 1], torch.full((2,), 0.3))
   sim.command_manager = SimpleNamespace(
     get_term=lambda _: SimpleNamespace(command=command)

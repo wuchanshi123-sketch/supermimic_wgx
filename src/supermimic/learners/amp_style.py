@@ -24,6 +24,8 @@ class AmpStyleCfg:
   hidden_dims: tuple[int, ...] = (1024, 512, 256)
   style_command_gate: float = 0.2
   """Command magnitude at which the style reward reaches full strength."""
+  style_speed_gate: bool = False
+  """Attenuate the style reward by planar and yaw tracking errors."""
   warm_start_actor_lr: float = 1e-5
   """Actor learning-rate cap when fine-tuning a saved velocity policy with AMP."""
   action_anchor_weight: float = 0.25

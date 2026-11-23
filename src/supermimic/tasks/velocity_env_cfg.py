@@ -214,7 +214,11 @@ class SimVelocityReward(ManagerTermBase):
       torso_tilt_error=2.0 * torso_quat[:, 1:3].square().sum(dim=-1),
       torso_roll_pitch_speed_sq=torso_omega[:, :2].square().sum(dim=-1),
       joint_acc_l2=joint_acc_l2,
-      angular_momentum_l2=env.scene["robot/root_angmom"].data.square().sum(dim=-1),
+      angular_momentum_l2=(
+        env.scene["robot/root_angmom"].data.square().sum(dim=-1)
+        if cfg.angular_momentum_cost > 0.0
+        else torch.zeros_like(joint_acc_l2)
+      ),
       self_collision_count=collision_count,
       foot_slip=foot_slip,
       soft_landing=soft_landing,
@@ -273,7 +277,7 @@ def _velocity_abs_error(env: ManagerBasedRlEnv, axis: int) -> torch.Tensor:
   return (_velocity_command(env)[..., axis] - actual).abs()
 
 
-def velocity_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
+def velocity_env_cfg(play: bool = False, *, amp: bool = False) -> ManagerBasedRlEnvCfg:
   """Build the standalone task using the mjlab G1 flat-ground hardware setup."""
   cfg = unitree_g1_flat_env_cfg(play=play)
   cfg.commands = {"twist": VelocityCommandCfg(external=play)}
@@ -297,9 +301,14 @@ def velocity_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       enable_corruption=False,
     ),
   }
+  reward_cfg = (
+    UnitreeVelocityRewardCfg(angular_momentum_cost=0.0)
+    if amp
+    else UnitreeVelocityRewardCfg()
+  )
   cfg.rewards = {
     "velocity": RewardTermCfg(
-      func=SimVelocityReward, weight=1.0, params={"cfg": UnitreeVelocityRewardCfg()}
+      func=SimVelocityReward, weight=1.0, params={"cfg": reward_cfg}
     )
   }
   cfg.terminations = {

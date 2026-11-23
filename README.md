@@ -119,8 +119,8 @@ velocity task. Following `supermimic_vibe`, the discriminator looks at two
 adjacent frames of 13 G1 links. Each frame contains link poses relative to the
 torso and linear and angular velocities in the links' local frames. The
 discriminator learns from real MuJoCo replay and reference clips. The actor
-receives the style reward during differentiable world-model rollouts alongside
-the existing velocity reward.
+receives the style reward during differentiable world-model rollouts. This task
+uses the velocity reward without the whole-body angular momentum penalty.
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 uv run src/supermimic/scripts/train.py \
@@ -142,8 +142,10 @@ reference samples.
 of `0.025` per step at 50 Hz. The reward follows Vibe's curve above a
 discriminator score of `-0.5` and uses a smooth exponential tail below that
 point so that poorly scored policy transitions can still receive a style
-gradient. The bonus ramps up from zero with the command magnitude and is
-reduced by linear and yaw tracking errors.
+gradient. The bonus ramps up from zero with the command magnitude. Speed
+tracking is rewarded separately and does not reduce the style bonus by default.
+Use `--runner.amp.style-speed-gate True` to restore the linear and yaw tracking
+error multiplier for comparison.
 `AMP/style_reward` reports the mean unweighted style score on real replay,
 before command and tracking factors. `AMP/expert_score`, `AMP/policy_score`
 and `AMP/gradient_penalty` describe discriminator training.
@@ -170,11 +172,13 @@ uv run src/supermimic/scripts/play.py SuperMimic-GenCoord-G1-Velocity \
 ```
 
 The left stick controls forward/backward and lateral velocity (both ±1.0 m/s).
-The right stick controls yaw rate (±3.0 rad/s). Centered sticks and a
-disconnected gamepad give a zero command. **Space** pauses or resumes, and
-**Enter** resets the robot. Use `ls -l /dev/input/by-id/*-joystick` to locate a
-stable device path. The player reads `actor.pt` directly and uses the sibling
-`runner_config.json` to recover a custom action limit when available.
+The right stick controls yaw rate (±3.0 rad/s). The top-right overlay shows
+the `vx`, `vy`, and `wz` targets sent to the policy after deadzone and speed
+scaling. Centered sticks and a disconnected gamepad give a zero command.
+**Space** pauses or resumes, and **Enter** resets the robot. Use
+`ls -l /dev/input/by-id/*-joystick` to locate a stable device path. The player
+reads `actor.pt` directly and uses the sibling `runner_config.json` to recover
+a custom action limit when available.
 
 When `world_model.pt` is present in the same checkpoint, the window also
 shows the world model prediction as a translucent blue robot. Both robots

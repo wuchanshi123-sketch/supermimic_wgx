@@ -195,7 +195,7 @@ def main() -> None:
   if chosen_task in (VELOCITY_TASK_ID, VELOCITY_AMP_TASK_ID):
     args = tyro.cli(VelocityPlayConfig, args=remaining_args, config=mjlab.TYRO_FLAGS)
     try:
-      play_velocity(args)
+      play_velocity(args, amp=chosen_task == VELOCITY_AMP_TASK_ID)
     except (
       GamepadError,
       NativeViewerStartupTimeout,

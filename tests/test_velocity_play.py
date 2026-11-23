@@ -11,6 +11,7 @@ from tensordict import TensorDict
 from supermimic.runners.velocity_runner import VelocityActor, VelocityRunnerCfg
 from supermimic.scripts.play_velocity import (
   GamepadVelocityPolicy,
+  GamepadVelocityViewer,
   VelocityWorldModelGhost,
   load_velocity_actor,
 )
@@ -41,11 +42,17 @@ def test_load_local_velocity_actor_with_custom_history(tmp_path, with_config):
 
 
 @pytest.mark.parametrize("with_ghost", [False, True])
-def test_gamepad_command_reaches_actor_and_environment_before_step(with_ghost):
-  env = SimpleNamespace(num_envs=1, device="cpu")
-  command = velocity_env_cfg(play=True).commands["twist"].build(env)
+@pytest.mark.parametrize("manual_reset", [False, True])
+def test_gamepad_command_reaches_actor_and_environment_before_step(
+  with_ghost, manual_reset
+):
+  cfg = velocity_env_cfg(play=True)
+  env = SimpleNamespace(num_envs=1, device="cpu", cfg=cfg, step_dt=0.02)
+  env.unwrapped = env
+  command = cfg.commands["twist"].build(env)
   indices = torch.tensor([0])
   command.reset(indices)
+  env.reset = lambda: command.reset(indices)
   samples = iter([(1.0, -1.0, 1.0), (-1.0, 1.0, -1.0), (0.0, 0.0, 0.0)])
   pad = SimpleNamespace(read=lambda: next(samples))
   calls, resets = [], []
@@ -59,6 +66,20 @@ def test_gamepad_command_reaches_actor_and_environment_before_step(with_ghost):
   policy = GamepadVelocityPolicy(
     lambda obs: obs["actor"], 2, command, pad, ghost=ghost if with_ghost else None
   )
+  viewer = GamepadVelocityViewer(env, policy, command)
+  overlays = []
+  handle = SimpleNamespace(is_running=lambda: True, set_texts=overlays.append)
+
+  def assert_overlay(mode, vx, vy, wz):
+    overlays.clear()
+    viewer._set_status_overlay(handle)
+    assert len(overlays) == 1
+    status, gamepad = overlays[0]
+    assert status[1] == mujoco.mjtGridPos.mjGRID_TOPLEFT.value
+    assert mode in status[3]
+    assert gamepad[1] == mujoco.mjtGridPos.mjGRID_TOPRIGHT.value
+    assert gamepad[2].splitlines()[-3:] == ["vx (m/s)", "vy (m/s)", "wz (rad/s)"]
+    assert gamepad[3].split() == [vx, vy, wz]
 
   def observation(value):
     fields = {"actor": torch.tensor([[value]]), "goal": torch.zeros(1, 3)}
@@ -66,18 +87,30 @@ def test_gamepad_command_reaches_actor_and_environment_before_step(with_ghost):
       fields["full_state"] = torch.tensor([[value * 10]])
     return TensorDict(fields, [1])
 
+  assert_overlay("RUNNING", "+0.00", "+0.00", "+0.00")
   torch.testing.assert_close(
     policy(observation(1.0)), torch.tensor([[1.0, 1.0, 1.0, -1.0, 3.0]])
   )
+  assert_overlay("RUNNING", "+1.00", "-1.00", "+3.00")
   command.compute(dt=10.0)
   torch.testing.assert_close(command.command, torch.tensor([[1.0, -1.0, 3.0]]))
+  viewer.pause()
+  assert_overlay("PAUSED", "+1.00", "-1.00", "+3.00")
+  viewer.resume()
   policy.reset(torch.tensor([False]))
   torch.testing.assert_close(
     policy(observation(2.0)), torch.tensor([[1.0, 2.0, -1.0, 1.0, -3.0]])
   )
-  command.reset(indices)
-  policy.reset(torch.tensor([True]))
+  assert_overlay("RUNNING", "-1.00", "+1.00", "-3.00")
+  viewer.pause()
+  if manual_reset:
+    viewer.reset_environment()
+  else:
+    command.reset(indices)
+    policy.reset(torch.tensor([True]))
   torch.testing.assert_close(command.command, torch.zeros(1, 3))
+  assert_overlay("PAUSED", "+0.00", "+0.00", "+0.00")
+  viewer.resume()
   torch.testing.assert_close(
     policy(observation(3.0)), torch.tensor([[3.0, 3.0, 0.0, 0.0, 0.0]])
   )
@@ -87,6 +120,11 @@ def test_gamepad_command_reaches_actor_and_environment_before_step(with_ghost):
       torch.tensor([[1.0, -1.0, 3.0], [-1.0, 1.0, -3.0], [0.0, 0.0, 0.0]]),
     )
     assert resets == [True]
+
+  overlays.clear()
+  handle.is_running = lambda: False
+  viewer._set_status_overlay(handle)
+  assert overlays == []
 
 
 def test_world_model_ghost_rolls_forward_and_reseeds_without_moving_real_robot():

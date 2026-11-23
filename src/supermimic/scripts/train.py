@@ -116,8 +116,9 @@ class VelocityTrainConfig:
 
 
 def train_velocity(remaining_args: list[str], task_id: str = VELOCITY_TASK_ID) -> None:
-  default = VelocityTrainConfig()
-  if task_id == VELOCITY_AMP_TASK_ID:
+  amp = task_id == VELOCITY_AMP_TASK_ID
+  default = VelocityTrainConfig(env=velocity_env_cfg(amp=amp))
+  if amp:
     default.runner.amp = replace(
       default.runner.amp,
       motion_file=str(Path(__file__).resolve().parents[4] / "WalkandRun_amp_walk_50hz"),

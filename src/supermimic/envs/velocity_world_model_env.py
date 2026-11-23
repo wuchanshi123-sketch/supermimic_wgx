@@ -61,11 +61,11 @@ class VelocityWorldModelEnv(DifferentiableWorldModelEnv):
     self._reward_cfg = reward_term.params["cfg"]
     self._evaluate_reward = reward_term.func.evaluate
     self._torso = VelocityTorsoKinematics(env.unwrapped)
-    self._angular_momentum = (
-      VelocityAngularMomentum(env.unwrapped)
-      if amp_features is None
-      else amp_features.kinematics
-    )
+    self._angular_momentum = None
+    if amp_features is not None:
+      self._angular_momentum = amp_features.kinematics
+    elif self._reward_cfg.angular_momentum_cost > 0.0:
+      self._angular_momentum = VelocityAngularMomentum(env.unwrapped)
     self._sim_context = sim_context
     self._com_slice = sim_context.find("base_com")
     self._reward_signals = reward_signals
@@ -84,6 +84,7 @@ class VelocityWorldModelEnv(DifferentiableWorldModelEnv):
     self._style_command_gate = (
       amp_cfg.style_command_gate if amp_cfg is not None else 0.0
     )
+    self._style_speed_gate = amp_cfg is not None and amp_cfg.style_speed_gate
     self._fall_cfg = env.cfg.terminations["fall"].params["cfg"]
     self._joint_limits = env.unwrapped.scene["robot"].data.soft_joint_pos_limits[0]
     self.max_step_reward = (
@@ -132,20 +133,28 @@ class VelocityWorldModelEnv(DifferentiableWorldModelEnv):
     torso_tilt_error, torso_roll_pitch_speed_sq = self._torso(
       next_rep_state, next_aux_state[..., 3:7]
     )
-    com_ipos = (
-      self._sim_context.denormalize(sim_ctx, self._com_slice)
-      if self._com_slice is not None
-      else None
-    )
-    if self._amp_features is None:
-      angular_momentum_l2 = self._angular_momentum(next_rep_state, com_ipos)
-    else:
+    kin = None
+    if self._amp_features is not None:
+      assert self._angular_momentum is not None
       kin = self._angular_momentum.body_kinematics(next_rep_state)
-      angular_momentum_l2 = self._angular_momentum.from_kinematics(kin, com_ipos)
       next_features = self._amp_features(next_rep_state, kin)
       assert self._amp_discriminator is not None
       style = self._amp_discriminator.reward(self._amp_previous_features, next_features)
       self._amp_previous_features = next_features
+
+    angular_momentum_l2 = torch.zeros_like(term_prob)
+    if self._reward_cfg.angular_momentum_cost > 0.0:
+      assert self._angular_momentum is not None
+      com_ipos = (
+        self._sim_context.denormalize(sim_ctx, self._com_slice)
+        if self._com_slice is not None
+        else None
+      )
+      angular_momentum_l2 = (
+        self._angular_momentum(next_rep_state, com_ipos)
+        if kin is None
+        else self._angular_momentum.from_kinematics(kin, com_ipos)
+      )
     joint_acc_l2, collision_count, foot_slip, soft_landing = self._reward_signals(
       rep_state, action, sim_ctx
     ).unbind(-1)
@@ -170,14 +179,15 @@ class VelocityWorldModelEnv(DifferentiableWorldModelEnv):
     )
     if self._amp_features is not None:
       gate = amp_command_gate(self.velocity_command, self._style_command_gate)
-      # Style bonuses should be earned at the commanded speed. Use the same
-      # error widths as the task and score the post-transition velocity.
-      _, _, lin_vel, ang_vel, _, _ = decompose_rep_state(next_rep_state)
-      xy_error = (lin_vel[..., :2] - self.velocity_command[..., :2]).square().sum(-1)
-      yaw_error = (ang_vel[..., 2] - self.velocity_command[..., 2]).square()
-      tracking = torch.exp(
-        -xy_error / self._reward_cfg.linear_std**2
-        - yaw_error / self._reward_cfg.yaw_std**2
-      )
-      reward = reward + self._amp_step_scale * gate * style * tracking
+      style_bonus = self._amp_step_scale * gate * style
+      if self._style_speed_gate:
+        _, _, lin_vel, ang_vel, _, _ = decompose_rep_state(next_rep_state)
+        xy_error = (lin_vel[..., :2] - self.velocity_command[..., :2]).square().sum(-1)
+        yaw_error = (ang_vel[..., 2] - self.velocity_command[..., 2]).square()
+        tracking = torch.exp(
+          -xy_error / self._reward_cfg.linear_std**2
+          - yaw_error / self._reward_cfg.yaw_std**2
+        )
+        style_bonus = style_bonus * tracking
+      reward = reward + style_bonus
     return next_aux_state, next_rep_state, next_joint_state, term_prob, reward

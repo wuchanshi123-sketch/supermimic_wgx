@@ -57,7 +57,6 @@ class _BodyFeatures:
   def __init__(self):
     self.kinematics = SimpleNamespace(
       body_kinematics=lambda rep: rep,
-      from_kinematics=lambda rep, _com: torch.zeros_like(rep[:, 0]),
     )
 
   def __call__(self, rep, _kinematics=None):
@@ -65,10 +64,11 @@ class _BodyFeatures:
 
 
 @pytest.mark.parametrize("scale_by_dt", [True, False])
-def test_imagined_amp_reward_uses_current_command_and_next_state_speed(
-  monkeypatch, scale_by_dt
+@pytest.mark.parametrize("speed_gate", [False, True])
+def test_imagined_amp_reward_uses_current_command_and_optional_speed_gate(
+  monkeypatch, scale_by_dt, speed_gate
 ):
-  cfg = velocity_env_cfg()
+  cfg = velocity_env_cfg(amp=True)
   cfg.scale_rewards_by_dt = scale_by_dt
   cfg.rewards["velocity"].weight = 0.5
   cfg.commands["twist"] = replace(
@@ -78,11 +78,6 @@ def test_imagined_amp_reward_uses_current_command_and_next_state_speed(
     velocity_imagination,
     "VelocityTorsoKinematics",
     lambda _: lambda rep, _quat: (torch.zeros_like(rep[:, 0]),) * 2,
-  )
-  monkeypatch.setattr(
-    velocity_imagination,
-    "VelocityAngularMomentum",
-    lambda _: lambda rep, _com: torch.zeros_like(rep[:, 0]),
   )
   task_reward = cfg.rewards["velocity"]
   term = replace(
@@ -126,6 +121,8 @@ def test_imagined_amp_reward_uses_current_command_and_next_state_speed(
   style_cfg = AmpStyleCfg(
     motion_file="reference.npz", weight=0.8, style_command_gate=0.2
   )
+  if speed_gate:
+    style_cfg = replace(style_cfg, style_speed_gate=True)
   amp = VelocityWorldModelEnv(
     **env_kwargs,
     amp_discriminator=_StyleReward(),
@@ -171,7 +168,11 @@ def test_imagined_amp_reward_uses_current_command_and_next_state_speed(
   task_cfg = task_reward.params["cfg"]
   speed_std = torch.tensor([task_cfg.linear_std, task_cfg.linear_std, task_cfg.yaw_std])
   speed_offset = action.detach()[:, 1:4]
-  fidelity = (-(speed_offset / speed_std).square().sum(-1)).exp()
+  fidelity = (
+    (-(speed_offset / speed_std).square().sum(-1)).exp()
+    if speed_gate
+    else torch.ones_like(gate)
+  )
   style_bonus = 0.25 * expected_scale * gate * fidelity
   torch.testing.assert_close(baseline_reward, torch.full((NUM_ENVS,), 0.2 * dt_scale))
   torch.testing.assert_close(amp_reward - baseline_reward, style_bonus)
@@ -179,9 +180,12 @@ def test_imagined_amp_reward_uses_current_command_and_next_state_speed(
   assert amp.max_step_reward == pytest.approx(baseline.max_step_reward + expected_scale)
   gradient = torch.autograd.grad(amp_reward.sum(), action)[0]
   torch.testing.assert_close(gradient[:, 0], gate * expected_scale * fidelity)
-  torch.testing.assert_close(
-    gradient[:, 1:4], -2.0 * style_bonus[:, None] * speed_offset / speed_std.square()
+  expected_speed_gradient = (
+    -2.0 * style_bonus[:, None] * speed_offset / speed_std.square()
+    if speed_gate
+    else torch.zeros_like(speed_offset)
   )
+  torch.testing.assert_close(gradient[:, 1:4], expected_speed_gradient)
   torch.testing.assert_close(gradient[:, 4:], torch.zeros_like(gradient[:, 4:]))
 
 
@@ -204,11 +208,14 @@ def test_velocity_train_routes_optional_amp_config(monkeypatch, task_id, motion_
 
   def make_runner(env, cfg, **kwargs):
     assert tuple(env.commands) == ("twist",)
+    reward_cfg = env.rewards["velocity"].params["cfg"]
     if task_id == VELOCITY_AMP_TASK_ID:
       dataset = Path(__file__).resolve().parents[2] / "WalkandRun_amp_walk_50hz"
       assert cfg.amp.motion_file == str(dataset)
+      assert reward_cfg.angular_momentum_cost == 0.0
     else:
       assert cfg.amp.motion_file == motion_file
+      assert reward_cfg.angular_momentum_cost == 0.025
     assert cfg.amp.weight == (0.75 if motion_file else 1.25)
     return SimpleNamespace(run=lambda: executed.append(kwargs["task_id"]))
 
@@ -217,13 +224,14 @@ def test_velocity_train_routes_optional_amp_config(monkeypatch, task_id, motion_
   assert executed == [task_id]
 
 
-def test_velocity_amp_play_routes_to_existing_gamepad_player(monkeypatch):
+@pytest.mark.parametrize("task_id", [VELOCITY_TASK_ID, VELOCITY_AMP_TASK_ID])
+def test_velocity_play_routes_to_existing_gamepad_player(monkeypatch, task_id):
   monkeypatch.setattr(
     sys,
     "argv",
     [
       "play.py",
-      VELOCITY_AMP_TASK_ID,
+      task_id,
       "--checkpoint",
       "actor.pt",
       "--gamepad-device",
@@ -231,9 +239,12 @@ def test_velocity_amp_play_routes_to_existing_gamepad_player(monkeypatch):
     ],
   )
   received = []
-  monkeypatch.setattr(play, "play_velocity", received.append)
+  monkeypatch.setattr(
+    play, "play_velocity", lambda cfg, *, amp: received.append((cfg, amp))
+  )
   play.main()
-  (cfg,) = received
+  ((cfg, amp),) = received
+  assert amp == (task_id == VELOCITY_AMP_TASK_ID)
   assert cfg.checkpoint == Path("actor.pt")
   assert cfg.gamepad_device == Path("/dev/input/js1")
 
