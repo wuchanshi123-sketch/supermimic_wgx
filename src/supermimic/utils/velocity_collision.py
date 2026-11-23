@@ -25,12 +25,12 @@ _FOOT_SLIP_SCALE = 0.1
 _LANDING_FORCE_SCALE = 100.0
 
 
-def self_collision_sensor_cfg() -> ContactSensorCfg:
-  """Configure the same pelvis-subtree contact sensor as Unitree G1 Flat."""
+def self_collision_sensor_cfg(root_body_name: str = "pelvis") -> ContactSensorCfg:
+  """Detect contacts within the robot's root subtree."""
   return ContactSensorCfg(
     name=_SELF_COLLISION_NAME,
-    primary=ContactMatch(mode="subtree", pattern="pelvis", entity="robot"),
-    secondary=ContactMatch(mode="subtree", pattern="pelvis", entity="robot"),
+    primary=ContactMatch(mode="subtree", pattern=root_body_name, entity="robot"),
+    secondary=ContactMatch(mode="subtree", pattern=root_body_name, entity="robot"),
     fields=("found", "force"),
     reduce="none",
     num_slots=1,

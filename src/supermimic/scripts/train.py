@@ -14,8 +14,10 @@ from mjlab.tasks.registry import list_tasks, load_env_cfg
 import supermimic.tasks  # noqa: F401
 from supermimic.runners.supermimic_runner import SuperMimicRunner, SuperMimicRunnerCfg
 from supermimic.runners.velocity_runner import (
-  VELOCITY_AMP_TASK_ID,
+  R00_VELOCITY_TASK_IDS,
+  VELOCITY_AMP_TASK_IDS,
   VELOCITY_TASK_ID,
+  VELOCITY_TASK_IDS,
   VelocityRunner,
   VelocityRunnerCfg,
 )
@@ -24,7 +26,12 @@ from supermimic.scripts.train_utils import (
   download_registry_motions,
   setup_device,
 )
+from supermimic.tasks.r00_velocity_env_cfg import r00_velocity_env_cfg
 from supermimic.tasks.velocity_env_cfg import velocity_env_cfg
+from supermimic.tasks.velocity_rsi import (
+  REFERENCE_STATE_RESET_TERM,
+  reference_state_reset_event,
+)
 
 
 @dataclass
@@ -49,14 +56,14 @@ class TrainConfig:
 
 def main() -> None:
   # Parse first argument to choose the task.
-  all_tasks = sorted([*list_tasks(), VELOCITY_TASK_ID, VELOCITY_AMP_TASK_ID])
+  all_tasks = sorted([*list_tasks(), *VELOCITY_TASK_IDS])
   chosen_task, remaining_args = tyro.cli(
     tyro.extras.literal_type_from_choices(all_tasks),
     add_help=False,
     return_unknown_args=True,
     config=mjlab.TYRO_FLAGS,
   )
-  if chosen_task in (VELOCITY_TASK_ID, VELOCITY_AMP_TASK_ID):
+  if chosen_task in VELOCITY_TASK_IDS:
     train_velocity(remaining_args, chosen_task)
     return
   args = tyro.cli(
@@ -116,16 +123,32 @@ class VelocityTrainConfig:
 
 
 def train_velocity(remaining_args: list[str], task_id: str = VELOCITY_TASK_ID) -> None:
-  amp = task_id == VELOCITY_AMP_TASK_ID
-  default = VelocityTrainConfig(env=velocity_env_cfg(amp=amp))
+  amp = task_id in VELOCITY_AMP_TASK_IDS
+  r00 = task_id in R00_VELOCITY_TASK_IDS
+  env_cfg = r00_velocity_env_cfg if r00 else velocity_env_cfg
+  default = VelocityTrainConfig(env=env_cfg(amp=amp))
   if amp:
+    motions = (
+      Path.home() / "workspace/supermimic_vibe/data/processed/r00_amp_50hz.npz"
+      if r00
+      else Path(__file__).resolve().parents[4] / "WalkandRun_amp_walk_50hz"
+    )
     default.runner.amp = replace(
       default.runner.amp,
-      motion_file=str(Path(__file__).resolve().parents[4] / "WalkandRun_amp_walk_50hz"),
+      motion_file=str(motions),
+      rsi_probability=0.5 if r00 else 0.0,
     )
   args = tyro.cli(
     VelocityTrainConfig, args=remaining_args, default=default, config=mjlab.TYRO_FLAGS
   )
+  amp_cfg = args.runner.amp
+  if amp_cfg.rsi_probability > 0.0:
+    if not amp_cfg.motion_file:
+      raise ValueError("--runner.amp.rsi-probability requires --runner.amp.motion-file")
+    # Run after nominal resets so only the selected environments are overwritten.
+    args.env.events[REFERENCE_STATE_RESET_TERM] = reference_state_reset_event(
+      amp_cfg.motion_file, amp_cfg.rsi_probability
+    )
   device = setup_device(args.device)
   print(f"[INFO] Loading environment: {task_id}")
   env = create_env(args.env, args.num_envs, device)

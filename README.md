@@ -35,6 +35,9 @@ CUDA_VISIBLE_DEVICES=<GPU_ID> uv run src/supermimic/scripts/train.py \
   <TASK_ID> --runner.run_name <description>
 ```
 
+Training leaves the random seed unset (`None`) by default. Pass
+`--env.seed 42` to fix it, or `--env.seed -1` to draw one at startup.
+
 Training saves the initial weights in `checkpoint_0/` before the first
 iteration. By default, it then saves a separate checkpoint every 2,000 completed
 iterations (`checkpoint_2000/`, `checkpoint_4000/`, and so on). Each checkpoint
@@ -138,14 +141,16 @@ updates running normalization from both reference and replay frames and uses
 two least-squares batches per world-model update, with a gradient penalty on
 reference samples.
 
-`--runner.amp.weight` defaults to `1.25`, which gives a maximum style bonus
-of `0.025` per step at 50 Hz. The reward follows Vibe's curve above a
-discriminator score of `-0.5` and uses a smooth exponential tail below that
-point so that poorly scored policy transitions can still receive a style
-gradient. The bonus ramps up from zero with the command magnitude. Speed
-tracking is rewarded separately and does not reduce the style bonus by default.
+G1 and R00 AMP add a style bonus to the full task reward in imagined
+rollouts. `--runner.amp.weight` defaults to `1.25`, which caps the style
+bonus at `0.025` per step at 50 Hz. The reward follows Vibe's curve above
+a discriminator score of `-0.5` and uses a smooth exponential tail below
+that point so that poorly scored transitions still receive a style gradient.
+The bonus ramps up from zero with the command magnitude. Speed tracking is
+rewarded separately and does not reduce the style bonus by default.
 Use `--runner.amp.style-speed-gate True` to restore the linear and yaw tracking
-error multiplier for comparison.
+error multiplier for comparison. The MuJoCo episode return still reports the
+base task reward without the style bonus.
 `AMP/style_reward` reports the mean unweighted style score on real replay,
 before command and tracking factors. `AMP/expert_score`, `AMP/policy_score`
 and `AMP/gradient_penalty` describe discriminator training.
@@ -186,6 +191,57 @@ receive the same gamepad command. The ghost starts from the simulator state
 and follows its own predicted state for 100 control steps (2 seconds) before
 resynchronizing. Set `--num-steps-rollout` to change that interval. **R** toggles
 the ghost with the other debug visuals. Press **Enter** to reset both robots.
+
+### R00 velocity training and AMP
+
+R00 uses the 31-joint serial MuJoCo model, nominal pose, position PD gains
+and action scales from `supermimic_vibe`. It trains with the same differentiable
+world model and actor update as G1. Choose `SuperMimic-GenCoord-R00-Velocity` for
+velocity control without reference motions or `SuperMimic-GenCoord-R00-Velocity-AMP`
+to add a gait prior. Neither task uses PPO. The shared velocity reward uses an
+R00-specific posture target and torso; these tasks do not import Vibe's
+training schedule or auxiliary losses.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 uv run src/supermimic/scripts/train.py \
+  SuperMimic-GenCoord-R00-Velocity-AMP --device cuda:0 --num-envs 2048 \
+  --runner.run-name supermimic_r00_velocity_amp --runner.max-iterations 100000 \
+  --env.sim.mujoco.iterations 50 --env.sim.mujoco.ls-iterations 50
+```
+
+The AMP task defaults to
+`$HOME/workspace/supermimic_vibe/data/processed/r00_amp_50hz.npz`.
+Use `--runner.amp.motion-file` if that file is elsewhere. The packed 50 Hz
+dataset contains seven clips. The R00 discriminator uses 14 links relative
+to `waist_pitch_link`, with 210 features per frame; it samples transitions
+inside each clip. Start with fresh weights or an R00 checkpoint made by this
+framework. G1 and Vibe checkpoints do not share this task's model interface.
+
+R00 AMP uses reference-state initialization (RSI) for 50% of training episode
+resets by default. The reset draws a clip and a frame uniformly within it,
+copies the reference pose and velocities with small perturbations, and places
+the robot near its environment's origin. The other resets use the nominal
+standing pose. The speed command is resampled independently. This changes
+only the real MuJoCo reset; imagined rollouts still start from replay.
+Pass `--runner.amp.rsi-probability 0` to use only nominal resets or set another
+probability between `0` and `1`. G1 AMP defaults to `0` and can opt in with the
+same parameter. The probability is independent of the style reward weight.
+
+The first CUDA run can take a few minutes to compile. For a quick debugging run,
+set `TORCH_COMPILE_DISABLE=1` to skip PyTorch compilation.
+
+For gamepad playback, use the matching R00 task ID:
+
+```bash
+uv run src/supermimic/scripts/play.py SuperMimic-GenCoord-R00-Velocity-AMP \
+  --checkpoint "logs/SuperMimic-GenCoord-R00-Velocity-AMP/<run-timestamp>/actor.pt" \
+  --gamepad-device /dev/input/js1
+```
+
+R00 training and gamepad playback use `vx` from −0.5 to +1.0 m/s and
+`vy` ±0.5 m/s. R00 AMP training and gamepad playback use `wz` ±3.14 rad/s;
+plain R00 velocity training keeps `wz` ±1.0 rad/s. The window shows the
+requested speeds.
 
 ## Acknowledgements
 

@@ -1,4 +1,4 @@
-"""Differentiable torso stability signals for G1 velocity control."""
+"""Differentiable torso stability signals for velocity control."""
 
 from __future__ import annotations
 
@@ -16,13 +16,15 @@ if TYPE_CHECKING:
 
 
 class VelocityTorsoKinematics:
-  """Recover torso tilt and angular speed from the pelvis and waist state."""
+  """Recover torso tilt and angular speed from the root and waist state."""
 
-  def __init__(self, env: ManagerBasedRlEnv) -> None:
+  def __init__(
+    self, env: ManagerBasedRlEnv, torso_body_name: str = "torso_link"
+  ) -> None:
     robot = env.scene["robot"]
     model = env.sim.mj_model
     body_ids = robot.indexing.body_ids.cpu().tolist()
-    body_id = body_ids[robot.body_names.index("torso_link")]
+    body_id = body_ids[robot.body_names.index(torso_body_name)]
     joint_cols = {
       address: column
       for column, address in enumerate(robot.indexing.joint_q_adr.cpu().tolist())
@@ -35,7 +37,7 @@ class VelocityTorsoKinematics:
         or model.jnt_type[joint] != mujoco.mjtJoint.mjJNT_HINGE
       ):
         raise ValueError(
-          "Expected one hinge per body between the G1 pelvis and torso_link"
+          f"Expected one hinge per body between the robot root and {torso_body_name}"
         )
       address = int(model.jnt_qposadr[joint])
       fixed_q = model.body_quat[body_id]

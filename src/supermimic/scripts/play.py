@@ -25,7 +25,11 @@ from supermimic.runners.supermimic_runner import (
   build_actor,
   build_world_model,
 )
-from supermimic.runners.velocity_runner import VELOCITY_AMP_TASK_ID, VELOCITY_TASK_ID
+from supermimic.runners.velocity_runner import (
+  R00_VELOCITY_TASK_IDS,
+  VELOCITY_AMP_TASK_IDS,
+  VELOCITY_TASK_IDS,
+)
 from supermimic.scripts.play_velocity import VelocityPlayConfig, play_velocity
 from supermimic.scripts.viewers import (
   NativeViewerStartupTimeout,
@@ -185,17 +189,21 @@ def play(task_id: str, cfg: PlayConfig) -> None:
 
 
 def main() -> None:
-  all_tasks = sorted([*list_tasks(), VELOCITY_TASK_ID, VELOCITY_AMP_TASK_ID])
+  all_tasks = sorted([*list_tasks(), *VELOCITY_TASK_IDS])
   chosen_task, remaining_args = tyro.cli(
     tyro.extras.literal_type_from_choices(all_tasks),
     add_help=False,
     return_unknown_args=True,
     config=mjlab.TYRO_FLAGS,
   )
-  if chosen_task in (VELOCITY_TASK_ID, VELOCITY_AMP_TASK_ID):
+  if chosen_task in VELOCITY_TASK_IDS:
     args = tyro.cli(VelocityPlayConfig, args=remaining_args, config=mjlab.TYRO_FLAGS)
     try:
-      play_velocity(args, amp=chosen_task == VELOCITY_AMP_TASK_ID)
+      play_velocity(
+        args,
+        amp=chosen_task in VELOCITY_AMP_TASK_IDS,
+        r00=chosen_task in R00_VELOCITY_TASK_IDS,
+      )
     except (
       GamepadError,
       NativeViewerStartupTimeout,

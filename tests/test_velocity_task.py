@@ -174,7 +174,7 @@ def test_imagined_step_uses_pre_switch_command_and_matches_simulator_reward(
     (joint_acc.square().sum(-1), collision_count, foot_slip, soft_landing), dim=-1
   )
   monkeypatch.setattr(
-    velocity_imagination, "VelocityTorsoKinematics", lambda _: torso_state
+    velocity_imagination, "VelocityTorsoKinematics", lambda *_: torso_state
   )
   monkeypatch.setattr(
     velocity_imagination,

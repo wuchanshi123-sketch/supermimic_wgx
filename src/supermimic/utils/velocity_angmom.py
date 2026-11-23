@@ -32,7 +32,7 @@ def select_columns(x: torch.Tensor, columns: tuple[int, ...]) -> torch.Tensor:
 
 
 class VelocityAngularMomentum:
-  """Squared angular momentum of the G1 root subtree about its center of mass."""
+  """Squared angular momentum of the root subtree about its center of mass."""
 
   def __init__(self, env: ManagerBasedRlEnv) -> None:
     robot = env.scene["robot"]
@@ -51,7 +51,7 @@ class VelocityAngularMomentum:
     while remaining:
       current = [b for b in remaining if int(model.body_parentid[b]) in parents]
       if not current:
-        raise ValueError("Expected all G1 links to descend from its pelvis")
+        raise ValueError("Expected all robot links to descend from its root body")
 
       joints = []
       constants = []
@@ -62,7 +62,9 @@ class VelocityAngularMomentum:
         if num_joints:
           joint = model.body_jntadr[body]
           if num_joints != 1 or model.jnt_type[joint] != mujoco.mjtJoint.mjJNT_HINGE:
-            raise ValueError("Expected fixed or single-hinge links in the G1 subtree")
+            raise ValueError(
+              "Expected fixed or single-hinge links in the robot subtree"
+            )
           address = int(model.jnt_qposadr[joint])
           joints.append(cols[address])
           qpos0 = model.qpos0[address]

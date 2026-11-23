@@ -1,4 +1,4 @@
-"""Differentiable G1 velocity-control rollouts on the learned world model."""
+"""Differentiable velocity-control rollouts on the learned world model."""
 
 from __future__ import annotations
 
@@ -10,7 +10,10 @@ from tensordict import TensorDict
 
 from supermimic.envs.world_model_env import DifferentiableWorldModelEnv
 from supermimic.learners.amp_style import amp_command_gate
-from supermimic.tasks.velocity_env_cfg import advance_velocity_commands
+from supermimic.tasks.velocity_env_cfg import (
+  SimVelocityReward,
+  advance_velocity_commands,
+)
 from supermimic.utils.gencoord_helpers import decompose_rep_state
 from supermimic.utils.velocity_angmom import VelocityAngularMomentum
 from supermimic.utils.velocity_reward import velocity_fall_error
@@ -27,7 +30,7 @@ if TYPE_CHECKING:
 
 
 class VelocityWorldModelEnv(DifferentiableWorldModelEnv):
-  """Use sampled body-frame commands to score imagined G1 states."""
+  """Use sampled body-frame commands to score imagined robot states."""
 
   def __init__(
     self,
@@ -60,7 +63,10 @@ class VelocityWorldModelEnv(DifferentiableWorldModelEnv):
     reward_term = env.unwrapped.reward_manager.get_term_cfg("velocity")
     self._reward_cfg = reward_term.params["cfg"]
     self._evaluate_reward = reward_term.func.evaluate
-    self._torso = VelocityTorsoKinematics(env.unwrapped)
+    torso_name = getattr(
+      reward_term.func, "torso_body_name", SimVelocityReward.torso_body_name
+    )
+    self._torso = VelocityTorsoKinematics(env.unwrapped, torso_name)
     self._angular_momentum = None
     if amp_features is not None:
       self._angular_momentum = amp_features.kinematics

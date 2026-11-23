@@ -1,4 +1,4 @@
-"""World-model training for standalone G1 velocity control."""
+"""World-model training for standalone velocity control."""
 
 from __future__ import annotations
 
@@ -34,7 +34,15 @@ from supermimic.runners.supermimic_runner import (
   build_world_model,
 )
 from supermimic.tasks.velocity_env_cfg import SimVelocityReward, VelocityCommand
-from supermimic.utils.amp_body_features import AmpBodyFeatures
+from supermimic.tasks.velocity_rsi import (
+  REFERENCE_STATE_RESET_TERM,
+  ReferenceStateReset,
+)
+from supermimic.utils.amp_body_features import (
+  R00_AMP_ANCHOR_NAME,
+  R00_AMP_BODY_NAMES,
+  AmpBodyFeatures,
+)
 from supermimic.utils.amp_reference import AmpReference
 from supermimic.utils.local_checkpoints import resolve_checkpoint_actor
 from supermimic.utils.velocity_angmom import VelocityAngularMomentum
@@ -45,6 +53,11 @@ from supermimic.utils.velocity_collision import (
 
 VELOCITY_TASK_ID = "SuperMimic-GenCoord-G1-Velocity"
 VELOCITY_AMP_TASK_ID = "SuperMimic-GenCoord-G1-Velocity-AMP"
+R00_VELOCITY_TASK_ID = "SuperMimic-GenCoord-R00-Velocity"
+R00_VELOCITY_AMP_TASK_ID = "SuperMimic-GenCoord-R00-Velocity-AMP"
+R00_VELOCITY_TASK_IDS = (R00_VELOCITY_TASK_ID, R00_VELOCITY_AMP_TASK_ID)
+VELOCITY_AMP_TASK_IDS = (VELOCITY_AMP_TASK_ID, R00_VELOCITY_AMP_TASK_ID)
+VELOCITY_TASK_IDS = (VELOCITY_TASK_ID, VELOCITY_AMP_TASK_ID, *R00_VELOCITY_TASK_IDS)
 AMP_DISCRIMINATOR_VERSION = 3
 
 
@@ -149,11 +162,27 @@ class VelocityRunner(WorldModelRunner[VelocityRunnerCfg]):
     cfg = self.cfg.amp
     if cfg.motion_file is None or cfg.weight == 0:
       return None
-    joint_names = self.env.unwrapped.scene["robot"].joint_names
-    reference = AmpReference.load(
-      cfg.motion_file, joint_names, self.env.unwrapped.step_dt, self.device
+    env = self.env.unwrapped
+    reference = None
+    if REFERENCE_STATE_RESET_TERM in env.cfg.events:
+      term = env.event_manager.get_term_cfg(REFERENCE_STATE_RESET_TERM)
+      if (
+        isinstance(term.func, ReferenceStateReset)
+        and term.params["motion_file"] == cfg.motion_file
+      ):
+        reference = term.func.reference
+    if reference is None:
+      reference = AmpReference.load(
+        cfg.motion_file, env.scene["robot"].joint_names, env.step_dt, self.device
+      )
+    kinematics = VelocityAngularMomentum(env)
+    features = (
+      AmpBodyFeatures(
+        kinematics, body_names=R00_AMP_BODY_NAMES, anchor_name=R00_AMP_ANCHOR_NAME
+      )
+      if self.task_id in R00_VELOCITY_TASK_IDS
+      else AmpBodyFeatures(kinematics)
     )
-    features = AmpBodyFeatures(VelocityAngularMomentum(self.env.unwrapped))
     discriminator = AmpDiscriminator(features.feature_dim, cfg).to(self.device)
     with torch.no_grad():
       expert_features = torch.cat(

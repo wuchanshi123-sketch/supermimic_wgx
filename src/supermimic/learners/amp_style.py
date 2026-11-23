@@ -15,6 +15,8 @@ from supermimic.learners.learner_utils import _optimize_step
 class AmpStyleCfg:
   motion_file: str | None = None
   """Reference NPZ file, directory, or glob. None disables AMP."""
+  rsi_probability: float = 0.0
+  """Probability of initializing a real simulation episode from a reference frame."""
   weight: float = 1.25
   """Style reward rate. At 50 Hz, the maximum contribution per step is 0.025."""
   lr: float = 1e-4
@@ -32,6 +34,8 @@ class AmpStyleCfg:
   """Warm-start penalty weight on squared action deviation from the saved actor."""
 
   def __post_init__(self) -> None:
+    if not 0.0 <= self.rsi_probability <= 1.0:
+      raise ValueError("AMP rsi_probability must be between zero and one")
     for name in ("lr", "warm_start_actor_lr"):
       value = getattr(self, name)
       if not math.isfinite(value) or value <= 0.0:

@@ -1,4 +1,4 @@
-"""G1 flat-ground velocity commands, observations, and rewards."""
+"""Flat-ground velocity commands, observations, and rewards."""
 
 from __future__ import annotations
 
@@ -46,6 +46,7 @@ from supermimic.utils.velocity_feet import (
 from supermimic.utils.velocity_reward import VelocityTerminationCfg, velocity_fall_error
 
 if TYPE_CHECKING:
+  from mjlab.entity import Entity
   from mjlab.envs import ManagerBasedRlEnv, ManagerBasedRlEnvCfg
 
 
@@ -87,9 +88,16 @@ def _sample_velocity_command(
 ) -> torch.Tensor:
   """Sample standing, single-axis, and combined commands at a fixed batch shape."""
   axes = (cfg.lin_vel_x, cfg.lin_vel_y, cfg.ang_vel_z)
-  lower = like.new_tensor(tuple(axis[0] for axis in axes))
-  upper = like.new_tensor(tuple(axis[1] for axis in axes))
-  command = lower + torch.rand_like(like) * (upper - lower)
+  # Apply scalar bounds without creating a host tensor during CUDA graph capture.
+  command = torch.stack(
+    [
+      lower + sample * (upper - lower)
+      for (lower, upper), sample in zip(
+        axes, torch.rand_like(like).unbind(-1), strict=True
+      )
+    ],
+    dim=-1,
+  )
 
   mode = torch.rand_like(like[..., :1])
   axis = torch.randint(3, mode.shape, device=like.device)
@@ -151,7 +159,7 @@ def _velocity_command(env: ManagerBasedRlEnv) -> torch.Tensor:
   return env.command_manager.get_term("twist").command
 
 
-def _pelvis_rep_state(env: ManagerBasedRlEnv) -> torch.Tensor:
+def _root_rep_state(env: ManagerBasedRlEnv) -> torch.Tensor:
   robot = env.scene["robot"].data
   return torch.cat(
     [
@@ -169,15 +177,20 @@ def _pelvis_rep_state(env: ManagerBasedRlEnv) -> torch.Tensor:
 class SimVelocityReward(ManagerTermBase):
   """Evaluate the same pose and velocity objectives in MuJoCo and imagination."""
 
+  torso_body_name = "torso_link"
+
+  def _make_posture(self, robot: Entity) -> UnitreeVelocityPosture:
+    return UnitreeVelocityPosture(
+      robot.joint_names,
+      unitree_g1_home_joint_pos(robot.joint_names, robot.data.default_joint_pos[0]),
+    )
+
   def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRlEnv) -> None:
     del cfg
     super().__init__(env)
     robot = env.scene["robot"]
-    self._torso_id = robot.body_names.index("torso_link")
-    self._posture = UnitreeVelocityPosture(
-      robot.joint_names,
-      unitree_g1_home_joint_pos(robot.joint_names, robot.data.default_joint_pos[0]),
-    )
+    self._torso_id = robot.body_names.index(self.torso_body_name)
+    self._posture = self._make_posture(robot)
     self._foot_costs = VelocityFootCosts(env)
     self.signals = torch.zeros(
       env.num_envs, VELOCITY_REWARD_SIGNAL_COUNT, device=env.device
@@ -205,7 +218,7 @@ class SimVelocityReward(ManagerTermBase):
     torso_quat = robot.body_link_quat_w[:, self._torso_id]
     torso_omega = robot.body_link_ang_vel_w[:, self._torso_id]
     return self._evaluate_sim(
-      _pelvis_rep_state(env),
+      _root_rep_state(env),
       _velocity_command(env),
       env.action_manager.action,
       env.action_manager.prev_action,
@@ -265,7 +278,7 @@ class SimVelocityReward(ManagerTermBase):
 def sim_velocity_fall(
   env: ManagerBasedRlEnv, cfg: VelocityTerminationCfg
 ) -> torch.Tensor:
-  return velocity_fall_error(_pelvis_rep_state(env), cfg) >= 1.0
+  return velocity_fall_error(_root_rep_state(env), cfg) >= 1.0
 
 
 def _velocity_abs_error(env: ManagerBasedRlEnv, axis: int) -> torch.Tensor:
@@ -279,8 +292,27 @@ def _velocity_abs_error(env: ManagerBasedRlEnv, axis: int) -> torch.Tensor:
 
 def velocity_env_cfg(play: bool = False, *, amp: bool = False) -> ManagerBasedRlEnvCfg:
   """Build the standalone task using the mjlab G1 flat-ground hardware setup."""
-  cfg = unitree_g1_flat_env_cfg(play=play)
-  cfg.commands = {"twist": VelocityCommandCfg(external=play)}
+  return configure_velocity_env(
+    unitree_g1_flat_env_cfg(play=play),
+    play=play,
+    reward_cfg=UnitreeVelocityRewardCfg(angular_momentum_cost=0.0)
+    if amp
+    else UnitreeVelocityRewardCfg(),
+  )
+
+
+def configure_velocity_env(
+  cfg: ManagerBasedRlEnvCfg,
+  *,
+  play: bool,
+  reward_cfg: UnitreeVelocityRewardCfg,
+  fall_cfg: VelocityTerminationCfg | None = None,
+  command_cfg: VelocityCommandCfg | None = None,
+  root_body_name: str = "pelvis",
+  reward_term: type[SimVelocityReward] = SimVelocityReward,
+) -> ManagerBasedRlEnvCfg:
+  """Attach the shared velocity task to an existing flat robot environment."""
+  cfg.commands = {"twist": command_cfg or VelocityCommandCfg(external=play)}
   cfg.observations = {
     "actor": _sensor_actor_group(),
     "full_state": ObservationGroupCfg(
@@ -301,20 +333,13 @@ def velocity_env_cfg(play: bool = False, *, amp: bool = False) -> ManagerBasedRl
       enable_corruption=False,
     ),
   }
-  reward_cfg = (
-    UnitreeVelocityRewardCfg(angular_momentum_cost=0.0)
-    if amp
-    else UnitreeVelocityRewardCfg()
-  )
   cfg.rewards = {
-    "velocity": RewardTermCfg(
-      func=SimVelocityReward, weight=1.0, params={"cfg": reward_cfg}
-    )
+    "velocity": RewardTermCfg(func=reward_term, weight=1.0, params={"cfg": reward_cfg})
   }
   cfg.terminations = {
     "time_out": cfg.terminations["time_out"],
     "fall": TerminationTermCfg(
-      func=sim_velocity_fall, params={"cfg": VelocityTerminationCfg()}
+      func=sim_velocity_fall, params={"cfg": fall_cfg or VelocityTerminationCfg()}
     ),
   }
   cfg.metrics = {
@@ -327,5 +352,8 @@ def velocity_env_cfg(play: bool = False, *, amp: bool = False) -> ManagerBasedRl
   }
   cfg.events["reset_robot_joints"].params["position_range"] = (-0.02, 0.02)
   cfg.curriculum = {}
-  cfg.scene.sensors = (self_collision_sensor_cfg(), foot_ground_contact_sensor_cfg())
+  cfg.scene.sensors = (
+    self_collision_sensor_cfg(root_body_name),
+    foot_ground_contact_sensor_cfg(),
+  )
   return cfg

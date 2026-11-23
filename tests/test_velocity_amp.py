@@ -22,14 +22,20 @@ from supermimic.learners.wm_learner import WorldModelLearner
 from supermimic.representations import create_representation
 from supermimic.runners.velocity_runner import (
   AMP_DISCRIMINATOR_VERSION,
+  R00_VELOCITY_AMP_TASK_ID,
+  R00_VELOCITY_TASK_ID,
+  R00_VELOCITY_TASK_IDS,
   VELOCITY_AMP_TASK_ID,
+  VELOCITY_AMP_TASK_IDS,
   VELOCITY_TASK_ID,
+  VELOCITY_TASK_IDS,
   VelocityRunner,
   VelocityRunnerCfg,
 )
 from supermimic.scripts import play, train
 from supermimic.scripts.train_utils import create_env
 from supermimic.tasks.velocity_env_cfg import velocity_env_cfg
+from supermimic.tasks.velocity_rsi import REFERENCE_STATE_RESET_TERM
 from supermimic.utils.gencoord_helpers import full_state_offsets
 
 NUM_JOINTS = 29
@@ -65,7 +71,7 @@ class _BodyFeatures:
 
 @pytest.mark.parametrize("scale_by_dt", [True, False])
 @pytest.mark.parametrize("speed_gate", [False, True])
-def test_imagined_amp_reward_uses_current_command_and_optional_speed_gate(
+def test_imagined_amp_adds_gated_style_to_full_task_reward(
   monkeypatch, scale_by_dt, speed_gate
 ):
   cfg = velocity_env_cfg(amp=True)
@@ -77,14 +83,12 @@ def test_imagined_amp_reward_uses_current_command_and_optional_speed_gate(
   monkeypatch.setattr(
     velocity_imagination,
     "VelocityTorsoKinematics",
-    lambda _: lambda rep, _quat: (torch.zeros_like(rep[:, 0]),) * 2,
+    lambda *_: lambda rep, _quat: (torch.zeros_like(rep[:, 0]),) * 2,
   )
   task_reward = cfg.rewards["velocity"]
   term = replace(
     task_reward,
-    func=SimpleNamespace(
-      evaluate=lambda rep, *args, **kwargs: torch.full_like(rep[:, 0], 0.4)
-    ),
+    func=SimpleNamespace(evaluate=lambda rep, *args, **kwargs: 0.4 + 0.1 * rep[:, 6]),
   )
   limits = torch.tensor([-1.0, 1.0]).expand(1, NUM_JOINTS, 2)
   robot = SimpleNamespace(data=SimpleNamespace(soft_joint_pos_limits=limits))
@@ -118,9 +122,7 @@ def test_imagined_amp_reward_uses_current_command_and_optional_speed_gate(
     "reward_signals": lambda *args: torch.zeros(NUM_ENVS, 4),
   }
   baseline = VelocityWorldModelEnv(**env_kwargs)
-  style_cfg = AmpStyleCfg(
-    motion_file="reference.npz", weight=0.8, style_command_gate=0.2
-  )
+  style_cfg = AmpStyleCfg(motion_file="reference.npz")
   if speed_gate:
     style_cfg = replace(style_cfg, style_speed_gate=True)
   amp = VelocityWorldModelEnv(
@@ -163,7 +165,7 @@ def test_imagined_amp_reward_uses_current_command_and_optional_speed_gate(
   obs, amp_reward, _, _ = amp.step(action)
 
   dt_scale = DT if scale_by_dt else 1.0
-  expected_scale = style_cfg.weight * dt_scale
+  expected_scale = 0.025 if scale_by_dt else 1.25
   gate = torch.tensor([0.0, 1.0, 1.0, 0.5])
   task_cfg = task_reward.params["cfg"]
   speed_std = torch.tensor([task_cfg.linear_std, task_cfg.linear_std, task_cfg.yaw_std])
@@ -173,9 +175,11 @@ def test_imagined_amp_reward_uses_current_command_and_optional_speed_gate(
     if speed_gate
     else torch.ones_like(gate)
   )
-  style_bonus = 0.25 * expected_scale * gate * fidelity
-  torch.testing.assert_close(baseline_reward, torch.full((NUM_ENVS,), 0.2 * dt_scale))
-  torch.testing.assert_close(amp_reward - baseline_reward, style_bonus)
+  style_bonus = action.detach()[:, 0] * expected_scale * gate * fidelity
+  torch.testing.assert_close(
+    baseline_reward, torch.full((NUM_ENVS,), 0.2125 * dt_scale)
+  )
+  torch.testing.assert_close(amp_reward, baseline_reward + style_bonus)
   torch.testing.assert_close(obs["actor"][1, -3:], torch.zeros(3))
   assert amp.max_step_reward == pytest.approx(baseline.max_step_reward + expected_scale)
   gradient = torch.autograd.grad(amp_reward.sum(), action)[0]
@@ -186,21 +190,33 @@ def test_imagined_amp_reward_uses_current_command_and_optional_speed_gate(
     else torch.zeros_like(speed_offset)
   )
   torch.testing.assert_close(gradient[:, 1:4], expected_speed_gradient)
-  torch.testing.assert_close(gradient[:, 4:], torch.zeros_like(gradient[:, 4:]))
+  torch.testing.assert_close(
+    gradient[:, 4], torch.full((NUM_ENVS,), 0.5 * 0.1 * dt_scale)
+  )
+  torch.testing.assert_close(gradient[:, 5:], torch.zeros_like(gradient[:, 5:]))
 
 
 @pytest.mark.parametrize(
-  ("task_id", "motion_file"),
+  ("task_id", "motion_file", "rsi_override"),
   [
-    (VELOCITY_TASK_ID, None),
-    (VELOCITY_TASK_ID, "custom.npz"),
-    (VELOCITY_AMP_TASK_ID, None),
+    (VELOCITY_TASK_ID, None, None),
+    (VELOCITY_TASK_ID, "custom.npz", None),
+    (VELOCITY_AMP_TASK_ID, None, None),
+    (VELOCITY_AMP_TASK_ID, None, 0.25),
+    (R00_VELOCITY_TASK_ID, None, None),
+    (R00_VELOCITY_AMP_TASK_ID, None, None),
+    (R00_VELOCITY_AMP_TASK_ID, "custom.npz", None),
+    (R00_VELOCITY_AMP_TASK_ID, None, 0.0),
   ],
 )
-def test_velocity_train_routes_optional_amp_config(monkeypatch, task_id, motion_file):
+def test_velocity_train_routes_optional_amp_config(
+  monkeypatch, task_id, motion_file, rsi_override
+):
   argv = ["train.py", task_id, "--num-envs", "4"]
   if motion_file is not None:
     argv += ["--runner.amp.motion-file", motion_file, "--runner.amp.weight", "0.75"]
+  if rsi_override is not None:
+    argv += ["--runner.amp.rsi-probability", str(rsi_override)]
   monkeypatch.setattr(sys, "argv", argv)
   monkeypatch.setattr(train, "setup_device", lambda _: "cpu")
   monkeypatch.setattr(train, "create_env", lambda cfg, n, device: cfg)
@@ -209,14 +225,34 @@ def test_velocity_train_routes_optional_amp_config(monkeypatch, task_id, motion_
   def make_runner(env, cfg, **kwargs):
     assert tuple(env.commands) == ("twist",)
     reward_cfg = env.rewards["velocity"].params["cfg"]
-    if task_id == VELOCITY_AMP_TASK_ID:
-      dataset = Path(__file__).resolve().parents[2] / "WalkandRun_amp_walk_50hz"
-      assert cfg.amp.motion_file == str(dataset)
+    if task_id in VELOCITY_AMP_TASK_IDS:
+      dataset = (
+        Path.home() / "workspace/supermimic_vibe/data/processed/r00_amp_50hz.npz"
+        if task_id == R00_VELOCITY_AMP_TASK_ID
+        else Path(__file__).resolve().parents[2] / "WalkandRun_amp_walk_50hz"
+      )
+      assert cfg.amp.motion_file == (motion_file or str(dataset))
       assert reward_cfg.angular_momentum_cost == 0.0
     else:
       assert cfg.amp.motion_file == motion_file
       assert reward_cfg.angular_momentum_cost == 0.025
     assert cfg.amp.weight == (0.75 if motion_file else 1.25)
+    expected_rsi = 0.5 if task_id == R00_VELOCITY_AMP_TASK_ID else 0.0
+    if rsi_override is not None:
+      expected_rsi = rsi_override
+    assert cfg.amp.rsi_probability == expected_rsi
+    if expected_rsi > 0.0:
+      assert tuple(env.events)[-1] == REFERENCE_STATE_RESET_TERM
+      reset_term = env.events[REFERENCE_STATE_RESET_TERM]
+      assert reset_term.mode == "reset"
+      assert reset_term.params["probability"] == expected_rsi
+      assert reset_term.params["motion_file"] == cfg.amp.motion_file
+    else:
+      assert REFERENCE_STATE_RESET_TERM not in env.events
+    torso = env.rewards["velocity"].func.torso_body_name
+    assert torso == (
+      "waist_pitch_link" if task_id in R00_VELOCITY_TASK_IDS else "torso_link"
+    )
     return SimpleNamespace(run=lambda: executed.append(kwargs["task_id"]))
 
   monkeypatch.setattr(train, "VelocityRunner", make_runner)
@@ -224,7 +260,7 @@ def test_velocity_train_routes_optional_amp_config(monkeypatch, task_id, motion_
   assert executed == [task_id]
 
 
-@pytest.mark.parametrize("task_id", [VELOCITY_TASK_ID, VELOCITY_AMP_TASK_ID])
+@pytest.mark.parametrize("task_id", VELOCITY_TASK_IDS)
 def test_velocity_play_routes_to_existing_gamepad_player(monkeypatch, task_id):
   monkeypatch.setattr(
     sys,
@@ -240,11 +276,12 @@ def test_velocity_play_routes_to_existing_gamepad_player(monkeypatch, task_id):
   )
   received = []
   monkeypatch.setattr(
-    play, "play_velocity", lambda cfg, *, amp: received.append((cfg, amp))
+    play, "play_velocity", lambda cfg, *, amp, r00: received.append((cfg, amp, r00))
   )
   play.main()
-  ((cfg, amp),) = received
-  assert amp == (task_id == VELOCITY_AMP_TASK_ID)
+  ((cfg, amp, r00),) = received
+  assert amp == (task_id in VELOCITY_AMP_TASK_IDS)
+  assert r00 == (task_id in R00_VELOCITY_TASK_IDS)
   assert cfg.checkpoint == Path("actor.pt")
   assert cfg.gamepad_device == Path("/dev/input/js1")
 

@@ -117,23 +117,27 @@ class UnitreeVelocityRewardCfg:
 
 
 class UnitreeVelocityPosture:
-  """Default G1 posture and per-joint widths in model joint order."""
+  """Nominal posture and per-joint widths in model joint order."""
 
   def __init__(
-    self, joint_names: Sequence[str], default_joint_pos: torch.Tensor
+    self,
+    joint_names: Sequence[str],
+    default_joint_pos: torch.Tensor,
+    *,
+    joint_widths: Sequence[tuple[str, float, float]] = _POSTURE_WIDTHS,
   ) -> None:
     if default_joint_pos.shape[-1] != len(joint_names):
       raise ValueError("The Unitree posture target must match the robot's joint count")
     walking, running = [], []
     for name in joint_names:
       joint_name = name.rsplit("/", 1)[-1]
-      for fragment, walk, run in _POSTURE_WIDTHS:
+      for fragment, walk, run in joint_widths:
         if fragment in joint_name:
           walking.append(walk)
           running.append(run)
           break
       else:
-        raise ValueError(f"No Unitree G1 posture widths for joint {name!r}")
+        raise ValueError(f"No posture widths for joint {name!r}")
     self.default_joint_pos = default_joint_pos
     self.walking_std = default_joint_pos.new_tensor(walking)
     self.running_std = default_joint_pos.new_tensor(running)

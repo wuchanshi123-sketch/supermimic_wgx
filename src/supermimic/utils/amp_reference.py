@@ -1,4 +1,4 @@
-"""Load clip-safe G1 expert transitions for AMP velocity training."""
+"""Load clip-safe expert transitions for AMP velocity training."""
 
 from __future__ import annotations
 
@@ -28,7 +28,7 @@ def _resolve_motion_files(source: str | Path) -> list[Path]:
   return files
 
 
-def _load_clip(path: Path, joints: tuple[str, ...], dt: float) -> np.ndarray:
+def _load_clips(path: Path, joints: tuple[str, ...], dt: float) -> list[np.ndarray]:
   with np.load(path, allow_pickle=False) as motion:
     fps = float(motion["fps"].item())
     if not math.isfinite(fps) or not math.isclose(fps * dt, 1.0, rel_tol=1e-5):
@@ -43,10 +43,6 @@ def _load_clip(path: Path, joints: tuple[str, ...], dt: float) -> np.ndarray:
     if len(columns) != len(names) or columns.keys() != set(joints):
       raise ValueError("joint_names must match the robot's joints with no duplicates")
 
-    num_frames = len(motion["joint_pos"])
-    if num_frames < 2:
-      raise ValueError("each AMP clip must have at least two frames")
-
     # Keep the same layout as the simulator's GenCoord full_state observation.
     layout = (
       ("root_pos_w", 3),
@@ -56,14 +52,38 @@ def _load_clip(path: Path, joints: tuple[str, ...], dt: float) -> np.ndarray:
       ("root_ang_vel_w", 3),
       ("joint_vel", len(joints)),
     )
+    packed = "joint_pos" not in motion.files and (
+      "qpos" in motion.files or "qvel" in motion.files
+    )
+    if packed:
+      qpos, qvel = motion["qpos"], motion["qvel"]
+      if qpos.ndim != 2 or qpos.shape[1] != 7 + len(joints):
+        raise ValueError(f"qpos must have shape (frames, {7 + len(joints)})")
+      if qvel.shape != (len(qpos), 6 + len(joints)):
+        raise ValueError(f"qvel must have shape ({len(qpos)}, {6 + len(joints)})")
+      # Vibe's packed MotionLibrary stores both root velocities in world axes.
+      values = (
+        qpos[:, :3],
+        qpos[:, 3:7],
+        qpos[:, 7:],
+        qvel[:, :3],
+        qvel[:, 3:6],
+        qvel[:, 6:],
+      )
+      num_frames = len(qpos)
+    else:
+      values = tuple(motion[name] for name, _ in layout)
+      num_frames = len(values[2])
+    if num_frames < 2:
+      raise ValueError("each AMP clip must have at least two frames")
+
     arrays = {}
-    for name, width in layout:
-      values = motion[name]
-      if values.shape != (num_frames, width) or values.dtype.kind not in "fiu":
+    for (name, width), value in zip(layout, values, strict=True):
+      if value.shape != (num_frames, width) or value.dtype.kind not in "fiu":
         raise ValueError(
           f"{name} must be a real array with shape ({num_frames}, {width})"
         )
-      arrays[name] = values.astype(np.float32, copy=False)
+      arrays[name] = value.astype(np.float32, copy=False)
       if not np.isfinite(arrays[name]).all():
         raise ValueError(f"{name} contains non-finite values")
 
@@ -76,7 +96,30 @@ def _load_clip(path: Path, joints: tuple[str, ...], dt: float) -> np.ndarray:
     order = [columns[joint] for joint in joints]
     for name in ("joint_pos", "joint_vel"):
       arrays[name] = arrays[name][:, order]
-    return np.concatenate([arrays[name] for name, _ in layout], axis=-1)
+    states = np.concatenate([arrays[name] for name, _ in layout], axis=-1)
+    if not packed:
+      return [states]
+
+    starts, lengths = motion["starts"], motion["lengths"]
+    if (
+      starts.ndim != 1
+      or starts.size == 0
+      or starts.shape != lengths.shape
+      or starts.dtype.kind not in "iu"
+      or lengths.dtype.kind not in "iu"
+    ):
+      raise ValueError(
+        "starts and lengths must be nonempty integer vectors of equal size"
+      )
+    clips = []
+    previous_end = 0
+    for start, length in zip(starts.tolist(), lengths.tolist(), strict=True):
+      end = start + length
+      if start < previous_end or length < 2 or end > num_frames:
+        raise ValueError("invalid starts and lengths for packed AMP clips")
+      clips.append(states[start:end])
+      previous_end = end
+    return clips
 
 
 @dataclass(frozen=True)
@@ -115,14 +158,15 @@ class AmpReference:
       raise ValueError("The robot's AMP joint names must be nonempty and unique")
 
     files = _resolve_motion_files(motion_file)
-    clips, starts = [], []
-    boundaries = [0]
+    clips = []
     for path in files:
       try:
-        clip = _load_clip(path, joints, dt)
+        clips.extend(_load_clips(path, joints, dt))
       except (BadZipFile, KeyError, OSError, TypeError, ValueError) as exc:
         raise ValueError(f"Invalid AMP reference {path}: {exc}") from exc
-      clips.append(clip)
+    starts = []
+    boundaries = [0]
+    for clip in clips:
       start = boundaries[-1]
       end = start + len(clip)
       starts.append(np.arange(start, end - 1, dtype=np.int64))

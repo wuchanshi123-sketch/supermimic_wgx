@@ -1,0 +1,6 @@
+R00 31-DoF serial MuJoCo model and referenced meshes
+
+Copied from supermimic_vibe/assets/robots/r00. The Vibe import traces these
+assets to nexus_rl_lab commit 92ed461aab3263027e22722f32582fbd9988b9c9,
+under assets/robots_description/r00_description. The upstream repository
+license is preserved as source-LICENCE.

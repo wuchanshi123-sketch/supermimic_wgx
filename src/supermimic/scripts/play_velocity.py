@@ -1,4 +1,4 @@
-"""Drive a local G1 velocity actor with a gamepad in native MuJoCo."""
+"""Drive a local velocity actor with a gamepad in native MuJoCo."""
 
 from __future__ import annotations
 
@@ -22,6 +22,7 @@ from supermimic.runners.velocity_runner import VelocityActor, VelocityRunnerCfg
 from supermimic.scripts.native_viewer import ManagedNativeMujocoViewer
 from supermimic.scripts.train_utils import create_env, setup_device
 from supermimic.scripts.viewers import create_wm_vis_model
+from supermimic.tasks.r00_velocity_env_cfg import r00_velocity_env_cfg
 from supermimic.tasks.velocity_env_cfg import VelocityCommand, velocity_env_cfg
 from supermimic.utils.gamepad import Gamepad
 from supermimic.utils.local_checkpoints import resolve_checkpoint_actor
@@ -88,7 +89,9 @@ def load_velocity_actor(
   # Linear weights encode the history and hidden widths, even for a copied actor.pt.
   layers = _linear_weights(state, "network")
   if not layers or layers[-1].shape[0] != num_actions:
-    raise ValueError(f"Checkpoint does not match the G1 velocity actor: {checkpoint}")
+    raise ValueError(
+      f"Checkpoint does not match the robot's velocity actor: {checkpoint}"
+    )
   input_dim = layers[0].shape[1]
   history_length, extra = divmod(input_dim - command_dim, sensor_dim)
   if history_length < 1 or extra:
@@ -108,7 +111,7 @@ def load_velocity_actor(
     actor.load_state_dict(state)
   except RuntimeError as exc:
     raise ValueError(
-      f"Checkpoint does not match the G1 velocity actor: {checkpoint}"
+      f"Checkpoint does not match the robot's velocity actor: {checkpoint}"
     ) from exc
   return actor.to(device).eval(), history_length
 
@@ -118,7 +121,7 @@ def load_velocity_world_model(
 ) -> WorldModel:
   bundle = torch.load(checkpoint, map_location="cpu", weights_only=True)
   if not isinstance(bundle, dict) or not isinstance(bundle.get("dynamics"), dict):
-    raise ValueError(f"Expected a G1 velocity world model bundle in {checkpoint}")
+    raise ValueError(f"Expected a velocity world model bundle in {checkpoint}")
   layers = _linear_weights(bundle["dynamics"], "mlp")
   if not layers:
     raise ValueError(f"Missing dynamics network weights in {checkpoint}")
@@ -128,7 +131,7 @@ def load_velocity_world_model(
     wm.load_bundle(bundle)
   except (KeyError, RuntimeError) as exc:
     raise ValueError(
-      f"Checkpoint does not match the G1 velocity world model: {checkpoint}"
+      f"Checkpoint does not match the robot's velocity world model: {checkpoint}"
     ) from exc
   wm.dynamics.eval()
   return wm
@@ -309,13 +312,16 @@ class GamepadVelocityViewer(ManagedNativeMujocoViewer):
     )
 
 
-def play_velocity(cfg: VelocityPlayConfig, *, amp: bool = False) -> None:
+def play_velocity(
+  cfg: VelocityPlayConfig, *, amp: bool = False, r00: bool = False
+) -> None:
   if cfg.num_steps_rollout < 1:
     raise ValueError("--num-steps-rollout must be positive")
   actor_path = resolve_checkpoint_actor(cfg.checkpoint.expanduser())
   wm_path = actor_path.with_name("world_model.pt")
   device = setup_device(cfg.device)
-  env_cfg = velocity_env_cfg(play=True, amp=amp)
+  env_factory = r00_velocity_env_cfg if r00 else velocity_env_cfg
+  env_cfg = env_factory(play=True, amp=amp)
   env_cfg.sim.mujoco.iterations = 50
   env_cfg.sim.mujoco.ls_iterations = 50
 
