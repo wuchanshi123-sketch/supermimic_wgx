@@ -76,8 +76,15 @@ class VelocityRewardSignalModel(nn.Module):
       output.weight.zero_()
       output.bias.copy_(torch.tensor([-2.0, -5.0, -4.0, -5.0]))
 
-  def load_checkpoint(self, state_dict: dict[str, torch.Tensor]) -> None:
-    """Preserve legacy acceleration and self-collision predictions at warm start."""
+  def load_checkpoint(
+    self, state_dict: dict[str, torch.Tensor], *, add_damping: bool = False
+  ) -> None:
+    """Preserve existing reward predictions when adding inputs or outputs."""
+    if add_damping:
+      state_dict = {
+        **state_dict,
+        "network.0.weight": F.pad(state_dict["network.0.weight"], (0, 1)),
+      }
     layer = f"network.{len(self.network) - 1}"
     weight_key, bias_key = f"{layer}.weight", f"{layer}.bias"
     saved_weight = state_dict.get(weight_key)

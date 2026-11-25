@@ -195,7 +195,10 @@ the ghost with the other debug visuals. Press **Enter** to reset both robots.
 ### R00 velocity training and AMP
 
 R00 uses the 31-joint serial MuJoCo model, nominal pose, position PD gains
-and action scales from `supermimic_vibe`. It trains with the same differentiable
+and action scales from `supermimic_vibe`. Each foot uses seven longitudinal
+collision cylinders fitted to the common outline of the two foot meshes'
+lowest 4 mm. The right foot mirrors the left, and the lowest contact surface
+is 68 mm below the ankle on both sides. R00 trains with the same differentiable
 world model and actor update as G1. Choose `SuperMimic-GenCoord-R00-Velocity` for
 velocity control without reference motions or `SuperMimic-GenCoord-R00-Velocity-AMP`
 to add a gait prior. Neither task uses PPO. The shared velocity reward uses an
@@ -227,6 +230,35 @@ Pass `--runner.amp.rsi-probability 0` to use only nominal resets or set another
 probability between `0` and `1`. G1 AMP defaults to `0` and can opt in with the
 same parameter. The probability is independent of the style reward weight.
 
+R00 AMP training enables mirror consistency by default. Use
+`--runner.amp.mirror-consistency False` to disable it or
+`--runner.amp.mirror-consistency True --runner.amp.mirror-weight 1.0` to
+select the default weight explicitly. Each actor minibatch compares its
+actions at replay start states with its actions at reflected states. A
+reflection exchanges the two sides and transforms the full sensor history
+and the current command, including the signs of `vy` and `wz`. The log
+metric `Policy/mirror_action_mse` is the unweighted mean squared difference
+between the reflected prediction and the mirrored original raw action.
+
+At each R00 AMP episode reset, the simulator samples one passive damping
+coefficient uniformly from 0 to 0.3 N·m·s/rad per environment and applies
+it to all 31 hinge joints. The world model receives this coefficient as a
+privileged context input. Local playback uses zero passive damping. When
+resuming an older checkpoint with `--runner.init-checkpoint`, the loader
+initializes the new damping input weights to zero.
+
+R00 AMP training enables low-speed pure-turn rewards by default. These terms
+have full weight for near-zero planar commands and yaw commands of
+`0.4–1.0 rad/s` in either direction, with smooth transitions at the edges.
+The reward penalizes loaded foot twist, encourages foot clearance up to
+5 cm and adds a bonus for valid alternating landings with at least 3 cm
+of clearance and 0.30–0.75 s of swing. It replaces the
+instantaneous planar tracking error during pure turns with a drift error
+relative to a fixed turn center, using a 6 cm deadband. The world model uses
+cylinder clearance to estimate support and seeds turn history from replay.
+Use `--runner.turn-reward.enabled False` for comparison runs.
+The `Episode_Metrics/turn_*` logs report the active gate and turn signals.
+
 The first CUDA run can take a few minutes to compile. For a quick debugging run,
 set `TORCH_COMPILE_DISABLE=1` to skip PyTorch compilation.
 
@@ -238,10 +270,35 @@ uv run src/supermimic/scripts/play.py SuperMimic-GenCoord-R00-Velocity-AMP \
   --gamepad-device /dev/input/js1
 ```
 
-R00 training and gamepad playback use `vx` from −0.5 to +1.0 m/s and
-`vy` ±0.5 m/s. R00 AMP training and gamepad playback use `wz` ±3.14 rad/s;
-plain R00 velocity training keeps `wz` ±1.0 rad/s. The window shows the
-requested speeds.
+R00 AMP training and R00 gamepad playback use `vx` and `vy` ±1.0 m/s and
+`wz` ±2.0 rad/s. Plain R00 velocity training uses `vx` from −0.5 to +1.0 m/s,
+`vy` ±0.5 m/s, and `wz` ±1.0 rad/s. The playback window shows the requested
+speeds.
+
+### Export a velocity actor to ONNX
+
+The standalone G1 and R00 velocity policies, including AMP, can be exported on CPU.
+Pass an `actor.pt` file, a checkpoint directory, or a run directory with a latest actor link.
+
+```bash
+uv run src/supermimic/scripts/export_velocity_onnx.py \
+  --checkpoint "logs/SuperMimic-GenCoord-R00-Velocity-AMP/<run-timestamp>/checkpoint_44000" \
+  --output policy_supermimic_wgx.onnx
+```
+
+The script reads the action limit from the sibling `runner_config.json`. Use
+`--runner-config` to point to that file separately if you copied the actor.
+Without it, the loader uses the default limit of `3.0`. By default, the script
+writes alongside the resolved checkpoint with a `.onnx` suffix. Use
+`--overwrite` to replace an existing export after the new model passes validation.
+
+The ONNX graph takes a single `obs` input. Stack the sensor frames oldest to
+newest, with projected gravity, base angular velocity, relative joint
+position, joint velocity, and previous raw action in each frame. Append the
+current `[vx, vy, wz]` once at the end. The graph applies the learned
+normalization and action limit. Apply the deployment joint scale and offset to
+the `action` output. For R00 with a one-frame history, the shapes are
+`[1, 102]` for `obs` and `[1, 31]` for `action`.
 
 ## Acknowledgements
 

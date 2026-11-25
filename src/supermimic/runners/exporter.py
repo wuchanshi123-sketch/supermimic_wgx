@@ -38,6 +38,8 @@ def _export_onnx(
   input_names: list[str],
   output_names: list[str],
   path: str,
+  *,
+  opset_version: int = 18,
 ) -> None:
   # Export a CPU copy; captured training updates read the live parameters by address.
   module = copy.deepcopy(module).cpu().eval()
@@ -46,7 +48,7 @@ def _export_onnx(
     sample_inputs,
     path,
     export_params=True,
-    opset_version=18,
+    opset_version=opset_version,
     input_names=input_names,
     output_names=output_names,
     dynamic_axes={},

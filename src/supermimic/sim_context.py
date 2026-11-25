@@ -153,6 +153,25 @@ class EncoderBiasSpec(SimContextSpec):
     return env.scene[self._asset_name].data.encoder_bias
 
 
+class JointDampingSpec(SimContextSpec):
+  """Common passive damping of the robot joints, sampled per environment."""
+
+  name = "joint_damping"
+  dim = 1
+
+  def bind(self, env: ManagerBasedRlEnv) -> list[tuple[float, float]]:
+    params = env.cfg.events[self.name].params
+    if not params["shared_random"]:
+      raise ValueError("JointDampingSpec requires shared per-environment damping")
+    asset_cfg = params["asset_cfg"]
+    robot = env.scene[asset_cfg.name]
+    self._dof = int(robot.indexing.joint_v_adr[asset_cfg.joint_ids][0].item())
+    return [params["ranges"]]
+
+  def read(self, env: ManagerBasedRlEnv) -> torch.Tensor:
+    return env.sim.model.dof_damping[:, self._dof : self._dof + 1]
+
+
 class SimContext(nn.Module):
   def __init__(self, specs: list[SimContextSpec], ranges: list[tuple[float, float]]):
     super().__init__()
@@ -172,12 +191,13 @@ class SimContext(nn.Module):
       FootFrictionSpec,
       CoMOffsetSpec,
       EncoderBiasSpec,
+      JointDampingSpec,
     )
     specs = [c() for c in candidates if c.name in env.cfg.events]
     if not specs:
       raise RuntimeError(
         "No sim_ctx specs derived from env.cfg.events. "
-        "Enable at least one DR event (foot_friction, base_com, encoder_bias) "
+        "Enable at least one DR event (foot_friction, base_com, encoder_bias, joint_damping) "
         "in the task cfg."
       )
     return cls(specs, [r for s in specs for r in s.bind(env)]).to(env.device)

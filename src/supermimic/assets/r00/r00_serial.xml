@@ -122,12 +122,15 @@
                   <joint name="left_ankle_roll_joint" type="hinge" axis="1 0 0" armature="0.0048" range="-0.3490658504 0.3490658504" limited="true" actuatorfrclimited="true" actuatorfrcrange="-63.5 63.5" />
                   <inertial pos="0.015285 0.0008 -0.041225" mass="1.1912449195417769" fullinertia="0.000973681602212 0.00519740366292 0.00519740366292 -1.39290418166e-05 0.000484398021384 1.07690203896e-05" />
                   <geom class="visual" pos="0 0 0" quat="1 0 0 0" name="l_leg6_ankle_r_link_visual" type="mesh" mesh="l_leg6_ankle_r_link_visual_simplified" />
-                  <geom class="collision" pos="-0.04897 -0.03515 -0.0575" name="l_leg6_ankle_r_link_collision_sole_sphere_1" type="sphere" size="0.0105" />
-                  <geom class="collision" pos="0.12726 -0.03515 -0.0575" name="l_leg6_ankle_r_link_collision_sole_sphere_2" type="sphere" size="0.0105" />
-                  <geom class="collision" pos="0.15 0 -0.0575" name="l_leg6_ankle_r_link_collision_sole_sphere_3" type="sphere" size="0.0105" />
-                  <geom class="collision" pos="-0.04897 0.03724 -0.0575" name="l_leg6_ankle_r_link_collision_sole_sphere_4" type="sphere" size="0.0105" />
-                  <geom class="collision" pos="0.12726 0.03724 -0.0575" name="l_leg6_ankle_r_link_collision_sole_sphere_5" type="sphere" size="0.0105" />
-                  <geom class="collision" pos="-0.077 0 -0.0575" name="l_leg6_ankle_r_link_collision_sole_sphere_6" type="sphere" size="0.0105" />
+                  <!-- Fore-aft cylinders fitted to the lowest 4 mm of both foot meshes.
+                       Their lowest points lie on the existing sole plane at z=-0.068 m. -->
+                  <geom class="collision" pos="0.0385 -0.039 -0.0642" quat="0.707106781187 0 0.707106781187 0" name="l_leg6_ankle_r_link_collision_sole_cylinder_1" type="cylinder" size="0.0038 0.0819" />
+                  <geom class="collision" pos="0.0335 -0.029 -0.0612" quat="0.707106781187 0 0.707106781187 0" name="l_leg6_ankle_r_link_collision_sole_cylinder_2" type="cylinder" size="0.0068 0.1047" />
+                  <geom class="collision" pos="0.0283 -0.0125 -0.0577" quat="0.707106781187 0 0.707106781187 0" name="l_leg6_ankle_r_link_collision_sole_cylinder_3" type="cylinder" size="0.0103 0.1118" />
+                  <geom class="collision" pos="0.02725 0.0075 -0.0577" quat="0.707106781187 0 0.707106781187 0" name="l_leg6_ankle_r_link_collision_sole_cylinder_4" type="cylinder" size="0.0103 0.11295" />
+                  <geom class="collision" pos="0.03285 0.02525 -0.05995" quat="0.707106781187 0 0.707106781187 0" name="l_leg6_ankle_r_link_collision_sole_cylinder_5" type="cylinder" size="0.00805 0.10735" />
+                  <geom class="collision" pos="0.0334 0.0365 -0.0642" quat="0.707106781187 0 0.707106781187 0" name="l_leg6_ankle_r_link_collision_sole_cylinder_6" type="cylinder" size="0.0038 0.0938" />
+                  <geom class="collision" pos="0.06275 0.0435 -0.0642" quat="0.707106781187 0 0.707106781187 0" name="l_leg6_ankle_r_link_collision_sole_cylinder_7" type="cylinder" size="0.0038 0.04375" />
                 </body>
               </body>
             </body>
@@ -162,12 +165,13 @@
                   <joint name="right_ankle_roll_joint" type="hinge" axis="1 0 0" armature="0.0048" range="-0.3490658504 0.3490658504" limited="true" actuatorfrclimited="true" actuatorfrcrange="-63.5 63.5" />
                   <inertial pos="0.015285 -0.0008 -0.041225" mass="1.1912449195417769" fullinertia="0.000973681602212 0.00519740366292 0.00519740366292 1.39290418166e-05 0.000484398021384 -1.07690203896e-05" />
                   <geom class="visual" pos="0 0 0" quat="1 0 0 0" name="r_leg6_ankle_r_link_visual" type="mesh" mesh="r_leg6_ankle_r_link_visual_simplified" />
-                  <geom class="collision" pos="-0.04897 -0.03724 -0.0575" name="r_leg6_ankle_r_link_collision_sole_sphere_1" type="sphere" size="0.0105" />
-                  <geom class="collision" pos="0.12726 -0.03724 -0.0575" name="r_leg6_ankle_r_link_collision_sole_sphere_2" type="sphere" size="0.0105" />
-                  <geom class="collision" pos="0.15 0 -0.0575" name="r_leg6_ankle_r_link_collision_sole_sphere_3" type="sphere" size="0.0105" />
-                  <geom class="collision" pos="-0.04897 0.03515 -0.0575" name="r_leg6_ankle_r_link_collision_sole_sphere_4" type="sphere" size="0.0105" />
-                  <geom class="collision" pos="0.12726 0.03515 -0.0575" name="r_leg6_ankle_r_link_collision_sole_sphere_5" type="sphere" size="0.0105" />
-                  <geom class="collision" pos="-0.077 0 -0.0575" name="r_leg6_ankle_r_link_collision_sole_sphere_6" type="sphere" size="0.0105" />
+                  <geom class="collision" pos="0.0385 0.039 -0.0642" quat="0.707106781187 0 0.707106781187 0" name="r_leg6_ankle_r_link_collision_sole_cylinder_1" type="cylinder" size="0.0038 0.0819" />
+                  <geom class="collision" pos="0.0335 0.029 -0.0612" quat="0.707106781187 0 0.707106781187 0" name="r_leg6_ankle_r_link_collision_sole_cylinder_2" type="cylinder" size="0.0068 0.1047" />
+                  <geom class="collision" pos="0.0283 0.0125 -0.0577" quat="0.707106781187 0 0.707106781187 0" name="r_leg6_ankle_r_link_collision_sole_cylinder_3" type="cylinder" size="0.0103 0.1118" />
+                  <geom class="collision" pos="0.02725 -0.0075 -0.0577" quat="0.707106781187 0 0.707106781187 0" name="r_leg6_ankle_r_link_collision_sole_cylinder_4" type="cylinder" size="0.0103 0.11295" />
+                  <geom class="collision" pos="0.03285 -0.02525 -0.05995" quat="0.707106781187 0 0.707106781187 0" name="r_leg6_ankle_r_link_collision_sole_cylinder_5" type="cylinder" size="0.00805 0.10735" />
+                  <geom class="collision" pos="0.0334 -0.0365 -0.0642" quat="0.707106781187 0 0.707106781187 0" name="r_leg6_ankle_r_link_collision_sole_cylinder_6" type="cylinder" size="0.0038 0.0938" />
+                  <geom class="collision" pos="0.06275 -0.0435 -0.0642" quat="0.707106781187 0 0.707106781187 0" name="r_leg6_ankle_r_link_collision_sole_cylinder_7" type="cylinder" size="0.0038 0.04375" />
                 </body>
               </body>
             </body>

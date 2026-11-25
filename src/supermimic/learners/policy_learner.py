@@ -17,6 +17,10 @@ from supermimic.learners.learner_utils import (
   graph_state,
 )
 
+type InitialActionRegularizer = Callable[
+  [TensorDict, torch.Tensor], tuple[torch.Tensor, dict[str, torch.Tensor]]
+]
+
 
 @dataclass
 class BpttPolicyLearnerCfg:
@@ -72,11 +76,13 @@ class BpttPolicyLearner:
     actor_lr: float | None = None,
     action_regularizer: Callable[[TensorDict, torch.Tensor], torch.Tensor]
     | None = None,
+    initial_action_regularizer: InitialActionRegularizer | None = None,
   ):
     self.actor = policy
     self.wm_env = wm_env
     self.cfg = cfg
     self._action_regularizer = action_regularizer
+    self._initial_action_regularizer = initial_action_regularizer
     self.actor_params = list(self.actor.parameters())
     self.actor_optimizers = build_optimizers(
       [self.actor],
@@ -116,9 +122,16 @@ class BpttPolicyLearner:
     obs = self.wm_env.reset(start)
     ret, aux_loss, survival = 0.0, 0.0, 1.0
     action_penalty = 0.0
+    regularizer_stats: dict[str, torch.Tensor] = {}
     rollout: list[TensorDict] = []
     for t in range(cfg.horizon):
       actions = self._rollout_actor(obs)
+      if t == 0 and self._initial_action_regularizer is not None:
+        # Evaluate on real replay starts, before states depend on rollout actions.
+        batch_penalty, regularizer_stats = self._initial_action_regularizer(
+          obs, actions
+        )
+        aux_loss = aux_loss + batch_penalty
       next_obs, reward, term_prob, _ = self.wm_env.step(actions)
       step = {"critic": obs["critic"], "reward": reward, "done": term_prob}
       rollout.append(TensorDict(step, batch_size=reward.shape).detach())
@@ -134,7 +147,6 @@ class BpttPolicyLearner:
       obs = next_obs
     ret = ret + self._bootstrap(obs, survival, term_prob)
     loss = -ret + aux_loss
-    regularizer_stats = {}
     if self._action_regularizer is not None:
       loss = loss + action_penalty
       regularizer_stats["action_regularizer"] = (
@@ -187,6 +199,7 @@ class ActorCriticPolicyLearner(BpttPolicyLearner):
     actor_lr: float | None = None,
     action_regularizer: Callable[[TensorDict, torch.Tensor], torch.Tensor]
     | None = None,
+    initial_action_regularizer: InitialActionRegularizer | None = None,
   ):
     super().__init__(
       policy,
@@ -196,6 +209,7 @@ class ActorCriticPolicyLearner(BpttPolicyLearner):
       capture_updates=capture_updates,
       actor_lr=actor_lr,
       action_regularizer=action_regularizer,
+      initial_action_regularizer=initial_action_regularizer,
     )
     self.critic = critic
     self.critic_optimizers = build_optimizers([critic], self.cfg.lr, device=device)

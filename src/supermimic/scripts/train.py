@@ -14,6 +14,7 @@ from mjlab.tasks.registry import list_tasks, load_env_cfg
 import supermimic.tasks  # noqa: F401
 from supermimic.runners.supermimic_runner import SuperMimicRunner, SuperMimicRunnerCfg
 from supermimic.runners.velocity_runner import (
+  R00_VELOCITY_AMP_TASK_ID,
   R00_VELOCITY_TASK_IDS,
   VELOCITY_AMP_TASK_IDS,
   VELOCITY_TASK_ID,
@@ -27,7 +28,7 @@ from supermimic.scripts.train_utils import (
   setup_device,
 )
 from supermimic.tasks.r00_velocity_env_cfg import r00_velocity_env_cfg
-from supermimic.tasks.velocity_env_cfg import velocity_env_cfg
+from supermimic.tasks.velocity_env_cfg import configure_turn_reward, velocity_env_cfg
 from supermimic.tasks.velocity_rsi import (
   REFERENCE_STATE_RESET_TERM,
   reference_state_reset_event,
@@ -127,6 +128,8 @@ def train_velocity(remaining_args: list[str], task_id: str = VELOCITY_TASK_ID) -
   r00 = task_id in R00_VELOCITY_TASK_IDS
   env_cfg = r00_velocity_env_cfg if r00 else velocity_env_cfg
   default = VelocityTrainConfig(env=env_cfg(amp=amp))
+  if task_id == R00_VELOCITY_AMP_TASK_ID:
+    default.runner.turn_reward = replace(default.runner.turn_reward, enabled=True)
   if amp:
     motions = (
       Path.home() / "workspace/supermimic_vibe/data/processed/r00_amp_50hz.npz"
@@ -137,11 +140,17 @@ def train_velocity(remaining_args: list[str], task_id: str = VELOCITY_TASK_ID) -
       default.runner.amp,
       motion_file=str(motions),
       rsi_probability=0.5 if r00 else 0.0,
+      mirror_consistency=r00,
     )
   args = tyro.cli(
     VelocityTrainConfig, args=remaining_args, default=default, config=mjlab.TYRO_FLAGS
   )
   amp_cfg = args.runner.amp
+  turn_cfg = args.runner.turn_reward
+  if turn_cfg.enabled and task_id != R00_VELOCITY_AMP_TASK_ID:
+    raise ValueError("Pure-turn rewards require the R00 velocity AMP task")
+  if task_id == R00_VELOCITY_AMP_TASK_ID:
+    configure_turn_reward(args.env, turn_cfg)
   if amp_cfg.rsi_probability > 0.0:
     if not amp_cfg.motion_file:
       raise ValueError("--runner.amp.rsi-probability requires --runner.amp.motion-file")

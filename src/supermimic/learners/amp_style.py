@@ -32,6 +32,10 @@ class AmpStyleCfg:
   """Actor learning-rate cap when fine-tuning a saved velocity policy with AMP."""
   action_anchor_weight: float = 0.25
   """Warm-start penalty weight on squared action deviation from the saved actor."""
+  mirror_consistency: bool = False
+  """Enable the R00 actor's sagittal mirror consistency loss."""
+  mirror_weight: float = 1.0
+  """Per-step reward-rate weight on mean squared mirror error in raw actions."""
 
   def __post_init__(self) -> None:
     if not 0.0 <= self.rsi_probability <= 1.0:
@@ -45,6 +49,7 @@ class AmpStyleCfg:
       "gradient_penalty",
       "style_command_gate",
       "action_anchor_weight",
+      "mirror_weight",
     ):
       value = getattr(self, name)
       if not math.isfinite(value) or value < 0.0:

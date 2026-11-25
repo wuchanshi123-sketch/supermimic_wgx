@@ -6,6 +6,7 @@ import math
 from typing import TYPE_CHECKING, Any
 
 import torch
+from mjlab.utils.lab_api.math import quat_apply
 from tensordict import TensorDict
 
 from supermimic.envs.world_model_env import DifferentiableWorldModelEnv
@@ -15,9 +16,15 @@ from supermimic.tasks.velocity_env_cfg import (
   advance_velocity_commands,
 )
 from supermimic.utils.gencoord_helpers import decompose_rep_state
+from supermimic.utils.r00_turn_feet import R00TurnFeet
 from supermimic.utils.velocity_angmom import VelocityAngularMomentum
 from supermimic.utils.velocity_reward import velocity_fall_error
 from supermimic.utils.velocity_torso import VelocityTorsoKinematics
+from supermimic.utils.velocity_turn import (
+  TurnRewardCfg,
+  evaluate_turn,
+  turn_critic_context,
+)
 
 if TYPE_CHECKING:
   from supermimic.learners.amp_style import AmpDiscriminator, AmpStyleCfg
@@ -62,6 +69,7 @@ class VelocityWorldModelEnv(DifferentiableWorldModelEnv):
     self._command_cfg = env.cfg.commands["twist"]
     reward_term = env.unwrapped.reward_manager.get_term_cfg("velocity")
     self._reward_cfg = reward_term.params["cfg"]
+    self._turn_cfg = reward_term.params.get("turn_cfg", TurnRewardCfg())
     self._evaluate_reward = reward_term.func.evaluate
     torso_name = getattr(
       reward_term.func, "torso_body_name", SimVelocityReward.torso_body_name
@@ -70,8 +78,13 @@ class VelocityWorldModelEnv(DifferentiableWorldModelEnv):
     self._angular_momentum = None
     if amp_features is not None:
       self._angular_momentum = amp_features.kinematics
-    elif self._reward_cfg.angular_momentum_cost > 0.0:
+    elif self._reward_cfg.angular_momentum_cost > 0.0 or self._turn_cfg.enabled:
       self._angular_momentum = VelocityAngularMomentum(env.unwrapped)
+    self._turn_feet = (
+      R00TurnFeet(env.unwrapped, self._angular_momentum)
+      if self._turn_cfg.enabled
+      else None
+    )
     self._sim_context = sim_context
     self._com_slice = sim_context.find("base_com")
     self._reward_signals = reward_signals
@@ -96,11 +109,17 @@ class VelocityWorldModelEnv(DifferentiableWorldModelEnv):
     self.max_step_reward = (
       self._reward_cfg.max_reward * self._step_reward_scale + self._amp_step_scale
     )
+    if self._turn_feet is not None:
+      self.max_step_reward += (
+        self._step_reward_scale * self._turn_cfg.max_bonus_per_second(representation.dt)
+      )
 
   def _on_reset(self, batch: TensorDict) -> None:
     # The newest replay row contains the command that produced its action.
     self.velocity_command = batch["velocity_command"]
     self.command_time_left = batch["command_time_left"]
+    if self._turn_feet is not None:
+      self._turn_memory = batch["turn_memory"]
     self._reset_sensor_history(batch)
     if self._amp_features is not None:
       self._amp_previous_features = self._amp_features(self.rep_state)
@@ -117,7 +136,12 @@ class VelocityWorldModelEnv(DifferentiableWorldModelEnv):
     actor = self.representation.build_actor_obs(
       self._sensor_history(), self.velocity_command
     )
-    critic = torch.cat([self.rep_state, self.velocity_command, self.sim_ctx], dim=-1)
+    critic_inputs = [self.rep_state, self.velocity_command, self.sim_ctx]
+    if self._turn_feet is not None:
+      critic_inputs.append(
+        turn_critic_context(self._turn_memory, self.aux_state[..., :2])
+      )
+    critic = torch.cat(critic_inputs, dim=-1)
     return TensorDict(
       {"actor": actor, "critic": critic}, [self.num_envs], device=self.device
     )
@@ -140,13 +164,35 @@ class VelocityWorldModelEnv(DifferentiableWorldModelEnv):
       next_rep_state, next_aux_state[..., 3:7]
     )
     kin = None
-    if self._amp_features is not None:
+    if self._amp_features is not None or self._turn_feet is not None:
       assert self._angular_momentum is not None
       kin = self._angular_momentum.body_kinematics(next_rep_state)
+    if self._amp_features is not None:
       next_features = self._amp_features(next_rep_state, kin)
       assert self._amp_discriminator is not None
       style = self._amp_discriminator.reward(self._amp_previous_features, next_features)
       self._amp_previous_features = next_features
+
+    turn = None
+    if self._turn_feet is not None:
+      assert kin is not None
+      root_pos, root_quat = next_aux_state[..., :3], next_aux_state[..., 3:7]
+      height, foot_yaw, contact, load = self._turn_feet.from_kinematics(
+        kin, root_pos, root_quat
+      )
+      _, _, _, root_omega, _, _ = decompose_rep_state(next_rep_state)
+      self._turn_memory, turn = evaluate_turn(
+        self._turn_memory,
+        self.velocity_command,
+        root_pos[..., :2],
+        quat_apply(root_quat, root_omega)[..., 2],
+        height,
+        contact,
+        load,
+        foot_yaw,
+        self.representation.dt,
+        self._turn_cfg,
+      )
 
     angular_momentum_l2 = torch.zeros_like(term_prob)
     if self._reward_cfg.angular_momentum_cost > 0.0:
@@ -182,6 +228,7 @@ class VelocityWorldModelEnv(DifferentiableWorldModelEnv):
       foot_slip=foot_slip,
       soft_landing=soft_landing,
       terminated=term_prob,
+      turn=turn,
     )
     if self._amp_features is not None:
       gate = amp_command_gate(self.velocity_command, self._style_command_gate)

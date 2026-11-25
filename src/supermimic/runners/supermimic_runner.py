@@ -119,10 +119,37 @@ class WorldModel:
       "sim_context": self.sim_context.state_dict(),
     }
 
-  def load_bundle(self, bundle: dict) -> None:
-    """Load a ``world_model.pt`` bundle."""
-    self.dynamics.load_state_dict(bundle["dynamics"])
-    self.sim_context.load_state_dict(bundle["sim_context"])
+  def load_bundle(self, bundle: dict) -> bool:
+    """Restore the model and report whether the passive damping input was added."""
+    dynamics = bundle["dynamics"]
+    context = bundle["sim_context"]
+    width = self.sim_context.output_dim
+    damping_column = self.sim_context.find("joint_damping")
+    legacy_shape = (width - 1,)
+    add_damping = (
+      damping_column == slice(width - 1, width)
+      and context["mean"].shape == legacy_shape
+      and context["scale"].shape == legacy_shape
+    )
+    if add_damping:
+      # Older R00 AMP checkpoints predate the final, scalar damping input.
+      # A zero column reproduces their predictions for every damping value.
+      dynamics = {
+        **dynamics,
+        "mlp.0.weight": torch.nn.functional.pad(dynamics["mlp.0.weight"], (0, 1)),
+      }
+      context = {
+        **context,
+        "mean": torch.cat(
+          (context["mean"], self.sim_context.mean[-1:].to(context["mean"]))
+        ),
+        "scale": torch.cat(
+          (context["scale"], self.sim_context.scale[-1:].to(context["scale"]))
+        ),
+      }
+    self.dynamics.load_state_dict(dynamics)
+    self.sim_context.load_state_dict(context)
+    return add_damping
 
 
 def build_world_model(

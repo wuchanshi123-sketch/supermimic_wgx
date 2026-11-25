@@ -56,12 +56,13 @@ def _linear_weights(state: dict, module: str) -> list[torch.Tensor]:
 
 def load_velocity_actor(
   checkpoint: Path,
-  sensor_dim: int,
-  num_actions: int,
-  command_dim: int,
-  device: str,
+  sensor_dim: int | None = None,
+  num_actions: int | None = None,
+  command_dim: int = 3,
+  device: str = "cpu",
   runner_config: Path | None = None,
 ) -> tuple[VelocityActor, int]:
+  """Load a standalone actor, deriving its input layout for offline use."""
   checkpoint = resolve_checkpoint_actor(checkpoint.expanduser())
   if not checkpoint.is_file():
     raise FileNotFoundError(f"Actor checkpoint not found: {checkpoint}")
@@ -88,10 +89,14 @@ def load_velocity_actor(
 
   # Linear weights encode the history and hidden widths, even for a copied actor.pt.
   layers = _linear_weights(state, "network")
-  if not layers or layers[-1].shape[0] != num_actions:
+  if not layers or (num_actions is not None and layers[-1].shape[0] != num_actions):
     raise ValueError(
       f"Checkpoint does not match the robot's velocity actor: {checkpoint}"
     )
+  num_actions = layers[-1].shape[0]
+  if sensor_dim is None:
+    # Gravity and gyro, followed by joint positions, velocities and last actions.
+    sensor_dim = 6 + 3 * num_actions
   input_dim = layers[0].shape[1]
   history_length, extra = divmod(input_dim - command_dim, sensor_dim)
   if history_length < 1 or extra:

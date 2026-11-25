@@ -45,11 +45,13 @@ from supermimic.utils.amp_body_features import (
 )
 from supermimic.utils.amp_reference import AmpReference
 from supermimic.utils.local_checkpoints import resolve_checkpoint_actor
+from supermimic.utils.r00_symmetry import R00Symmetry
 from supermimic.utils.velocity_angmom import VelocityAngularMomentum
 from supermimic.utils.velocity_collision import (
   VELOCITY_REWARD_SIGNAL_COUNT,
   VelocityRewardSignalModel,
 )
+from supermimic.utils.velocity_turn import TURN_MEMORY_DIM, TurnRewardCfg
 
 VELOCITY_TASK_ID = "SuperMimic-GenCoord-G1-Velocity"
 VELOCITY_AMP_TASK_ID = "SuperMimic-GenCoord-G1-Velocity-AMP"
@@ -77,6 +79,7 @@ class VelocityRunnerCfg(WorldModelRunnerCfg):
   init_checkpoint: str | None = None
   """Local checkpoint directory supplying actor.pt and world_model.pt for a new run."""
   amp: AmpStyleCfg = field(default_factory=AmpStyleCfg)
+  turn_reward: TurnRewardCfg = field(default_factory=TurnRewardCfg)
 
   def __post_init__(self) -> None:
     if self.representation != "gencoord" or self.actor_obs != "proprio":
@@ -146,9 +149,11 @@ class VelocityRunner(WorldModelRunner[VelocityRunnerCfg]):
             raise ValueError(
               f"{model_path} uses a different {name} from the current env"
             )
-        wm.load_bundle(bundle)
+        added_damping = wm.load_bundle(bundle)
         if "velocity_reward_model" in bundle:
-          self._reward_signals.load_checkpoint(bundle["velocity_reward_model"])
+          self._reward_signals.load_checkpoint(
+            bundle["velocity_reward_model"], add_damping=added_damping
+          )
       except (KeyError, TypeError, RuntimeError) as exc:
         raise ValueError(
           f"World model from {model_path} does not match the current runner"
@@ -255,17 +260,23 @@ class VelocityRunner(WorldModelRunner[VelocityRunnerCfg]):
     )
 
   def _task_buffer_schema(self) -> dict[str, FieldSpec]:
-    return {
+    fields = {
       "velocity_command": FieldSpec(3),
       "command_time_left": FieldSpec(),
       "velocity_reward_signals": FieldSpec(VELOCITY_REWARD_SIGNAL_COUNT),
     }
+    if self._sim_reward.turn_memory is not None:
+      fields["turn_memory"] = FieldSpec(TURN_MEMORY_DIM)
+    return fields
 
   def _transition_task_fields(self) -> dict[str, torch.Tensor]:
-    return {
+    fields = {
       "velocity_command": self.velocity_command.command.clone(),
       "command_time_left": self.velocity_command.time_left.clone(),
     }
+    if self._sim_reward.turn_memory is not None:
+      fields["turn_memory"] = self._sim_reward.turn_memory.clone()
+    return fields
 
   def _transition_task_post_fields(self) -> dict[str, torch.Tensor]:
     return {"velocity_reward_signals": self._sim_reward.signals}
@@ -277,6 +288,8 @@ class VelocityRunner(WorldModelRunner[VelocityRunnerCfg]):
     critic_dim = (
       representation.rep_state_dim + self._num_goals + self._sim_context.output_dim
     )
+    if self._sim_reward.turn_memory is not None:
+      critic_dim += TURN_MEMORY_DIM
     actor = VelocityActor(actor_dim, self._num_actions, self.cfg).to(self.device)
     if self._init_actor_path is not None:
       weights = torch.load(self._init_actor_path, map_location="cpu", weights_only=True)
@@ -316,11 +329,11 @@ class VelocityRunner(WorldModelRunner[VelocityRunnerCfg]):
       self.wm_env.step = torch.compile(self.wm_env.step)
     actor_lr = None
     action_regularizer = None
+    reward_dt = representation.dt if self.env.cfg.scale_rewards_by_dt else 1.0
     if self._amp is not None and self._init_actor_path is not None:
       actor_lr = min(self.cfg.policy.lr, self.cfg.amp.warm_start_actor_lr)
       if self.cfg.amp.action_anchor_weight > 0.0:
         reference_actor = deepcopy(actor).eval().requires_grad_(False)
-        reward_dt = representation.dt if self.env.cfg.scale_rewards_by_dt else 1.0
         anchor_scale = self.cfg.amp.action_anchor_weight * reward_dt
 
         def action_anchor(obs: TensorDict, actions: torch.Tensor) -> torch.Tensor:
@@ -330,6 +343,33 @@ class VelocityRunner(WorldModelRunner[VelocityRunnerCfg]):
 
         action_regularizer = action_anchor
       print(f"[INFO] AMP warm-start actor learning rate: {actor_lr:g}")
+    mirror_regularizer = None
+    if self.cfg.amp.mirror_consistency:
+      if self.task_id != R00_VELOCITY_AMP_TASK_ID:
+        raise ValueError("Mirror consistency requires the R00 velocity AMP task")
+      symmetry = R00Symmetry(
+        self.env.unwrapped.scene["robot"].joint_names,
+        self.cfg.history_length,
+        self.device,
+      )
+      # Match the units of the discounted rollout return for one replay-state MSE.
+      discounted_steps = sum(
+        self.cfg.policy.gamma**t for t in range(self.cfg.policy.horizon)
+      )
+      mirror_scale = self.cfg.amp.mirror_weight * reward_dt * discounted_steps
+
+      def mirror_loss(
+        obs: TensorDict, actions: torch.Tensor
+      ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        mirrored = symmetry.mirror_obs(obs["actor"])
+        mirrored_actions = actor(
+          TensorDict({"actor": mirrored}, batch_size=obs.batch_size)
+        )
+        mse = (mirrored_actions - symmetry.mirror_action(actions)).square().mean()
+        return mirror_scale * mse, {"mirror_action_mse": mse.detach()}
+
+      mirror_regularizer = mirror_loss
+
     self.policy_learner = ActorCriticPolicyLearner(
       actor,
       critic,
@@ -338,6 +378,7 @@ class VelocityRunner(WorldModelRunner[VelocityRunnerCfg]):
       device=self.device,
       actor_lr=actor_lr,
       action_regularizer=action_regularizer,
+      initial_action_regularizer=mirror_regularizer,
     )
     self._action_noise = torch.zeros(
       self.env.num_envs, self._num_actions, device=self.device

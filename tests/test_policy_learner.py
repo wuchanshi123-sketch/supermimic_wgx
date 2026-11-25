@@ -150,3 +150,25 @@ def test_actor_learning_rate_override_keeps_critic_learning_rate():
   assert float(learner.critic_optimizers[0].param_groups[0]["lr"]) == pytest.approx(
     cfg.lr
   )
+
+
+def test_initial_action_regularizer_contributes_once_per_actor_batch():
+  actor = _DummyActor()
+  calls = []
+
+  def consistency(obs, actions):
+    calls.append(actions.shape)
+    mse = (actions + obs["actor"]).square().mean()
+    return 2.0 * mse, {"mirror_action_mse": mse.detach()}
+
+  learner = BpttPolicyLearner(
+    actor,
+    _ActiveTwoStepEnv(),
+    BpttPolicyLearnerCfg(horizon=2, num_batches=2),
+    initial_action_regularizer=consistency,
+  )
+  stats = learner.update()
+  assert calls == [torch.Size([NUM_ENVS, 1])] * 2
+  assert 0.99 < stats["Policy/mirror_action_mse"].item() <= 1.0
+  # Without the consistency term the reward pushes the weight upward.
+  assert actor.weight.item() < 0.0

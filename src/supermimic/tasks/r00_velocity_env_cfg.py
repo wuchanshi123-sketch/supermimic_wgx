@@ -9,7 +9,9 @@ from typing import TYPE_CHECKING
 import mujoco
 from mjlab.actuator import BuiltinPositionActuatorCfg
 from mjlab.entity import EntityArticulationInfoCfg, EntityCfg
+from mjlab.envs.mdp import dr
 from mjlab.envs.mdp.actions import JointPositionActionCfg
+from mjlab.managers import EventTermCfg, SceneEntityCfg
 from mjlab.tasks.velocity.config.g1.env_cfgs import unitree_g1_flat_env_cfg
 
 from supermimic.tasks.velocity_env_cfg import (
@@ -32,9 +34,9 @@ R00_ROOT_BODY = "base_link"
 R00_TORSO_BODY = "waist_pitch_link"
 _ASSET_DIR = Path(__file__).resolve().parents[1] / "assets" / "r00"
 _SOLE_GEOMS = tuple(
-  f"{side}_leg6_ankle_r_link_collision_sole_sphere_{number}"
+  f"{side}_leg6_ankle_r_link_collision_sole_cylinder_{number}"
   for side in ("l", "r")
-  for number in range(1, 7)
+  for number in range(1, 8)
 )
 
 # Vibe's R00 serial-model position control, grouped by joint name.
@@ -182,6 +184,8 @@ def r00_velocity_env_cfg(
   cfg = unitree_g1_flat_env_cfg(play=play)
   cfg.scene.entities = {"robot": get_r00_robot_cfg()}
   cfg.viewer.body_name = R00_TORSO_BODY
+  # A plane/cylinder pair can generate four contacts per row.
+  cfg.sim.nconmax = 64
   action = cfg.actions["joint_pos"]
   assert isinstance(action, JointPositionActionCfg)
   action.scale = dict(_ACTION_SCALES)
@@ -194,12 +198,12 @@ def r00_velocity_env_cfg(
   }
   cfg.events["reset_base"].params["pose_range"]["z"] = (-0.01, 0.01)
   command_cfg = VelocityCommandCfg(
-    lin_vel_x=(-0.5, 1.0),
-    lin_vel_y=(-0.5, 0.5),
-    ang_vel_z=(-3.14, 3.14) if play or amp else (-1.0, 1.0),
+    lin_vel_x=(-1.0, 1.0) if play or amp else (-0.5, 1.0),
+    lin_vel_y=(-1.0, 1.0) if play or amp else (-0.5, 0.5),
+    ang_vel_z=(-2.0, 2.0) if play or amp else (-1.0, 1.0),
     external=play,
   )
-  return configure_velocity_env(
+  cfg = configure_velocity_env(
     cfg,
     play=play,
     reward_cfg=UnitreeVelocityRewardCfg(angular_momentum_cost=0.0)
@@ -210,3 +214,16 @@ def r00_velocity_env_cfg(
     root_body_name=R00_ROOT_BODY,
     reward_term=R00SimVelocityReward,
   )
+  if amp:
+    # A shared coefficient mirrors the deployment XML's common passive damping.
+    cfg.events["joint_damping"] = EventTermCfg(
+      func=dr.joint_damping,
+      mode="reset",
+      params={
+        "asset_cfg": SceneEntityCfg("robot"),
+        "ranges": (0.0, 0.0) if play else (0.0, 0.3),
+        "operation": "abs",
+        "shared_random": True,
+      },
+    )
+  return cfg

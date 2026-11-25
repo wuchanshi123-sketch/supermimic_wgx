@@ -337,7 +337,9 @@ def test_velocity_replay_snapshots_command_before_step_and_keeps_continuous_wind
   runner.velocity_command = SimpleNamespace(command=command, time_left=countdown)
   actions = torch.zeros(NUM_ENVS, NUM_JOINTS)
   runner.action_manager = SimpleNamespace(action=actions)
-  runner._sim_reward = SimpleNamespace(signals=torch.zeros(NUM_ENVS, 4))
+  runner._sim_reward = SimpleNamespace(
+    signals=torch.zeros(NUM_ENVS, 4), turn_memory=None
+  )
   first_step_signals = torch.tensor([10.0, 1.0, 2.0, 300.0])
 
   def step(_actions):

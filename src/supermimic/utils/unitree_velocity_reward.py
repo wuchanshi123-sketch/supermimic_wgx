@@ -13,6 +13,7 @@ from dataclasses import dataclass
 import torch
 
 from supermimic.utils.gencoord_helpers import decompose_rep_state
+from supermimic.utils.velocity_turn import TurnRewardTerms
 
 # Widths (walking, running) are keyed by G1 joint name fragments.
 _POSTURE_WIDTHS = (
@@ -160,6 +161,7 @@ def unitree_velocity_reward(
   foot_slip: torch.Tensor,
   soft_landing: torch.Tensor,
   terminated: torch.Tensor,
+  turn: TurnRewardTerms | None = None,
 ) -> torch.Tensor:
   """Score post-step physics or imagined values before control-period scaling.
 
@@ -169,6 +171,10 @@ def unitree_velocity_reward(
   """
   _, _, lin_vel, ang_vel, joint_pos, _ = decompose_rep_state(rep_state)
   xy_error = (command[..., :2] - lin_vel[..., :2]).square().sum(-1)
+  turn_bonus = 0.0
+  if turn is not None:
+    xy_error = torch.lerp(xy_error, turn.drift_error, turn.gate)
+    turn_bonus = turn.gate * (turn.twist + turn.clearance + turn.alternating)
   linear_error = xy_error + 2.0 * lin_vel[..., 2].square()
   yaw_error = (command[..., 2] - ang_vel[..., 2]).square()
   angular_error = yaw_error + 0.05 * ang_vel[..., :2].square().sum(-1)
@@ -214,4 +220,5 @@ def unitree_velocity_reward(
     - cfg.stand_still_cost * stand_still
     - cfg.self_collision_cost * self_collision_count
     - foot_cost
+    + turn_bonus
   )

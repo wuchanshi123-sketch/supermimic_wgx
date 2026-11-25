@@ -28,6 +28,7 @@ from supermimic.tasks.env_cfgs import (
   root_ori,
   root_pos,
 )
+from supermimic.utils.r00_turn_feet import R00TurnFeet
 from supermimic.utils.unitree_velocity_reward import (
   UnitreeVelocityPosture,
   UnitreeVelocityRewardCfg,
@@ -44,6 +45,12 @@ from supermimic.utils.velocity_feet import (
   foot_ground_contact_sensor_cfg,
 )
 from supermimic.utils.velocity_reward import VelocityTerminationCfg, velocity_fall_error
+from supermimic.utils.velocity_turn import (
+  TURN_MEMORY_DIM,
+  TurnRewardCfg,
+  TurnRewardTerms,
+  evaluate_turn,
+)
 
 if TYPE_CHECKING:
   from mjlab.entity import Entity
@@ -186,7 +193,6 @@ class SimVelocityReward(ManagerTermBase):
     )
 
   def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRlEnv) -> None:
-    del cfg
     super().__init__(env)
     robot = env.scene["robot"]
     self._torso_id = robot.body_names.index(self.torso_body_name)
@@ -195,14 +201,36 @@ class SimVelocityReward(ManagerTermBase):
     self.signals = torch.zeros(
       env.num_envs, VELOCITY_REWARD_SIGNAL_COUNT, device=env.device
     )
+    self.turn_memory = None
+    self.turn_metrics: dict[str, torch.Tensor] = {}
+    self._turn_feet = None
+    turn_cfg = cfg.params.get("turn_cfg")
+    if turn_cfg is not None and turn_cfg.enabled:
+      self._turn_feet = R00TurnFeet(env)
+      self._evaluate_turn = (
+        torch.compile(evaluate_turn)
+        if torch.device(env.device).type == "cuda"
+        else evaluate_turn
+      )
+      self.turn_memory = self.signals.new_zeros((env.num_envs, TURN_MEMORY_DIM))
+      self.turn_metrics = {
+        name: self.signals.new_zeros(env.num_envs) for name in TurnRewardTerms._fields
+      }
     self._evaluate_sim = (
       torch.compile(self.evaluate)
       if torch.device(env.device).type == "cuda"
       else self.evaluate
     )
 
+  def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
+    if self.turn_memory is not None:
+      self.turn_memory[slice(None) if env_ids is None else env_ids] = 0.0
+
   def __call__(
-    self, env: ManagerBasedRlEnv, cfg: UnitreeVelocityRewardCfg
+    self,
+    env: ManagerBasedRlEnv,
+    cfg: UnitreeVelocityRewardCfg,
+    turn_cfg: TurnRewardCfg | None = None,
   ) -> torch.Tensor:
     robot = env.scene["robot"].data
     joint_acc_l2 = robot.joint_acc.square().sum(dim=-1)
@@ -217,9 +245,29 @@ class SimVelocityReward(ManagerTermBase):
     )
     torso_quat = robot.body_link_quat_w[:, self._torso_id]
     torso_omega = robot.body_link_ang_vel_w[:, self._torso_id]
+    command = _velocity_command(env)
+    turn = None
+    if self._turn_feet is not None:
+      assert self.turn_memory is not None and turn_cfg is not None
+      height, foot_yaw, contact, load = self._turn_feet.from_sim()
+      memory, turn = self._evaluate_turn(
+        self.turn_memory,
+        command,
+        root_pos(env)[:, :2],
+        robot.root_link_ang_vel_w[:, 2],
+        height,
+        contact,
+        load,
+        foot_yaw,
+        env.step_dt,
+        turn_cfg,
+      )
+      self.turn_memory.copy_(memory)
+      for name, value in zip(TurnRewardTerms._fields, turn, strict=True):
+        self.turn_metrics[name].copy_(value if name == "gate" else turn.gate * value)
     return self._evaluate_sim(
       _root_rep_state(env),
-      _velocity_command(env),
+      command,
       env.action_manager.action,
       env.action_manager.prev_action,
       robot.soft_joint_pos_limits,
@@ -236,6 +284,7 @@ class SimVelocityReward(ManagerTermBase):
       foot_slip=foot_slip,
       soft_landing=soft_landing,
       terminated=env.termination_manager.terminated,
+      turn=turn,
     )
 
   def evaluate(
@@ -255,6 +304,7 @@ class SimVelocityReward(ManagerTermBase):
     foot_slip: torch.Tensor,
     soft_landing: torch.Tensor,
     terminated: torch.Tensor,
+    turn: TurnRewardTerms | None = None,
   ) -> torch.Tensor:
     return unitree_velocity_reward(
       rep_state,
@@ -272,6 +322,7 @@ class SimVelocityReward(ManagerTermBase):
       foot_slip=foot_slip,
       soft_landing=soft_landing,
       terminated=terminated,
+      turn=turn,
     )
 
 
@@ -288,6 +339,27 @@ def _velocity_abs_error(env: ManagerBasedRlEnv, axis: int) -> torch.Tensor:
   else:
     actual = robot.root_link_lin_vel_b[..., axis]
   return (_velocity_command(env)[..., axis] - actual).abs()
+
+
+def _turn_metric(env: ManagerBasedRlEnv, name: str) -> torch.Tensor:
+  reward = env.reward_manager.get_term_cfg("velocity").func
+  assert isinstance(reward, SimVelocityReward)
+  return reward.turn_metrics[name]
+
+
+def configure_turn_reward(env: ManagerBasedRlEnvCfg, cfg: TurnRewardCfg) -> None:
+  """Install the same pure-turn objective for simulation and the world model."""
+  params = env.rewards["velocity"].params
+  if cfg.enabled:
+    params["turn_cfg"] = cfg
+  else:
+    params.pop("turn_cfg", None)
+  for name in TurnRewardTerms._fields:
+    key = f"turn_{name}"
+    if cfg.enabled:
+      env.metrics[key] = MetricsTermCfg(func=_turn_metric, params={"name": name})
+    else:
+      env.metrics.pop(key, None)
 
 
 def velocity_env_cfg(play: bool = False, *, amp: bool = False) -> ManagerBasedRlEnvCfg:
